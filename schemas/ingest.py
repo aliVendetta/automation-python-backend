@@ -12,5 +12,5 @@ class IngestRequest(BaseModel):
     source_filename: str
     supplier_email: Optional[str]
     supplier_name: Optional[str]
-    attachments: List[Attachment]
+    attachments: Optional[List[Attachment]]
     text_body: Optional[str]

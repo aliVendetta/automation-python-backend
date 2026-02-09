@@ -2,17 +2,14 @@ import uuid
 from datetime import datetime
 from schemas.output import OfferItem
 from core.openai_client import extract_offer
+from workers.state import JOB_RESULTS
 
-async def process_offer(payload) -> OfferItem:
+async def process_offer(payload, job_id: str):
     uid = str(uuid.uuid4())
 
-    # TEMP: text-only (attachments later)
     extracted = await extract_offer(payload.text_body or "")
 
-    # Normally: json.loads + validation
-    # Milestone 0: mocked merge
-
-    return OfferItem(
+    JOB_RESULTS[job_id] = OfferItem(
         uid=uid,
         alcohol_percent="11%",
         best_before_date=None,
