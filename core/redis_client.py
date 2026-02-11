@@ -1,5 +1,6 @@
 import os
 import redis
+from redis.cluster import RedisCluster
 import json
 from typing import Optional, Dict, Any
 
@@ -12,12 +13,36 @@ class RedisManager:
         self.client = None
 
         try:
-            REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-            self.client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5)
-            # Test connection
+            REDIS_URL = os.getenv("REDIS_URL")
+            if REDIS_URL and (":10000" in REDIS_URL or "clustered=true" in REDIS_URL):
+                import urllib.parse
+
+                parsed_url = urllib.parse.urlparse(REDIS_URL)
+                password = parsed_url.password
+                host = parsed_url.hostname
+                port = parsed_url.port
+
+                self.client = RedisCluster(
+                    host=host,
+                    port=port,
+                    password=password,
+                    ssl=True,
+                    ssl_cert_reqs=None,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    skip_full_coverage_check=True,
+                )
+            else:
+                self.client = redis.Redis.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=5
+                )
+
             self.client.ping()
             self.use_redis = True
             print("✓ Redis connected successfully")
+
         except Exception as e:
             print(f"⚠ Redis connection failed, using in-memory storage: {e}")
             self.use_redis = False
