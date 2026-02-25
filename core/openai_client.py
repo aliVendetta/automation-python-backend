@@ -20,247 +20,194 @@ async def extract_offer(text: str) -> dict:
     logger.info(f"extract_offer called with text length: {len(text)}")
     logger.debug(f"extract_offer text preview: {text[:200]}...")
 
-    prompt = f"""
-    You are extracting commercial alcohol offers from text.
-    Return JSON ONLY, no explanation.
+    # Maximum characters per chunk to prevent context overflow (roughly 5000 tokens)
+    # Using characters vs tokens as a rough generic heuristic
+    CHUNK_SIZE = 25000
+    
+    # Split text into manageable chunks
+    text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)] if len(text) > CHUNK_SIZE else [text]
+    logger.info(f"Split input text into {len(text_chunks)} chunk(s).")
+    
+    all_products = []
+    
+    for idx, chunk in enumerate(text_chunks):
+        logger.info(f"Processing chunk {idx + 1} of {len(text_chunks)}...")
+        
+        prompt = f"""
+        You are extracting commercial alcohol offers from text.
+        Return JSON ONLY, no explanation.
 
-    Extract ALL products from the text. Return a JSON object with a 'products' array containing ALL products found.
+        Extract ALL products from the text. Return a JSON object with a 'products' array containing ALL products found.
 
-    SCHEMA DEFINITION - Use EXACTLY these field names and rules:
-    - uid: Unique internal ID for each row (DO NOT generate this - leave as empty string "")
-    - product_key: Logical ID for deduplication (brand + name + volume + packaging) in UPPERCASE with underscores
-    - processing_version: Leave as empty string "" (backend will fill)
-    - brand: Brand or trademark
-    - product_name: Commercial product name
-    - product_reference: Supplier or internal reference/SKU
-    - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...)
-    - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...)
-    - origin_country: Country of origin (ISO 2 code or full name)
-    - vintage: Vintage year (for wine/champagne)
-    - alcohol_percent: Alcohol percentage
-    - packaging: Full packaging description (e.g. "6x750ml Bottles")
-    - unit_volume_ml: Volume per unit in milliliters (convert from CL: 75CL = 750ml)
-    - units_per_case: Number of units (bottles/cans) per case
-    - cases_per_pallet: Number of cases per pallet
-    - quantity_case: Number of cases offered
-    - bottle_or_can_type: "bottle", "can", or other
-    - price_per_unit: Unit price
-    - price_per_case: Case price
-    - currency: Currency (EUR, USD, GBP...)
-    - price_per_unit_eur: Unit price in EUR (same as price_per_unit if EUR)
-    - price_per_case_eur: Case price in EUR (same as price_per_case if EUR)
-    - incoterm: Incoterm (FOB, CIF, EXW, DAP…)
-    - location: Location/port associated with the incoterm
-    - min_order_quantity_case: Minimum order quantity in cases
-    - port: Port of loading/destination if applicable
-    - lead_time: Lead time or availability (e.g., "5 weeks", "Available now")
-    - supplier_name: Leave as empty string "" (will be filled by backend)
-    - supplier_reference: Supplier offer reference
-    - supplier_country: Supplier's country
-    - offer_date: Leave as empty string "" (backend will fill)
-    - valid_until: Offer validity date
-    - date_received: Leave as empty string "" (backend will fill)
-    - source_channel: Leave as empty string "" (backend will fill)
-    - source_filename: Leave as empty string "" (backend will fill)
-    - source_message_id: Leave as empty string "" (backend will fill)
-    - confidence_score: Leave as 0.0 (backend will fill)
-    - error_flags: Leave as empty array [] (backend will fill)
-    - needs_manual_review: Leave as false (backend will fill)
-    - best_before_date: Best before date (mainly for beers). Can be a date or 'fresh'
-    - label_language: Languages printed on label (e.g. 'UK text', 'SA label')
-    - ean_code: EAN product barcode
-    - gift_box: Indicates if includes gift box ("GBX" if yes, else "")
-    - refillable_status: "REF" for refillable, "NRF" for non-refillable
-    - custom_status: Customs status: "T1" or "T2"
-    - moq_cases: Minimum order quantity stated in the offer
+        SCHEMA DEFINITION - Use EXACTLY these field names and rules:
+        - uid: Unique internal ID for each row (DO NOT generate - leave as "Not Found")
+        - product_key: Logical ID for deduplication (brand + name + volume + packaging). UPPERCASE with underscores.
+        - processing_version: Backend version used (leave as "Not Found")
+        - brand: Brand or trademark of the product.
+        - product_name: Commercial product name.
+        - product_reference: Supplier or internal reference/SKU.
+        - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
+        - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
+        - origin_country: Country of origin (ISO 2 code or full name).
+        - vintage: Vintage year (for wine/champagne).
+        - alcohol_percent: Alcohol percentage if applicable.
+        - packaging: Full packaging description (e.g. 6x750ml).
+        - unit_volume_ml: Volume per unit in milliliters (convert CL: 75CL = 750ml).
+        - units_per_case: Number of units (bottles/cans) per case.
+        - cases_per_pallet: Number of cases per pallet.
+        - quantity_case: Number of cases offered or ordered.
+        - bottle_or_can_type: Packaging type (bottle/can/other).
+        - price_per_unit: Unit price.
+        - price_per_case: Case price.
+        - currency: Currency (EUR, USD, GBP...).
+        - price_per_unit_eur: Unit price converted into EUR.
+        - price_per_case_eur: Case price converted into EUR.
+        - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
+        - location: Location/port associated with the incoterm.
+        - min_order_quantity_case: Minimum order quantity in cases.
+        - port: Port of loading/destination if applicable.
+        - lead_time: Lead time or availability.
+        - supplier_name: Name of the supplier (leave as "Not Found").
+        - supplier_reference: Supplier offer reference.
+        - supplier_country: Supplier's country.
+        - offer_date: Date of the offer (leave as "Not Found").
+        - valid_until: Offer validity date.
+        - date_received: Actual timestamp when received (leave as "Not Found").
+        - source_channel: Source of data (leave as "Not Found").
+        - source_filename: Name of the received file (leave as "Not Found").
+        - source_message_id: Message ID (leave as "Not Found").
+        - confidence_score: Confidence indicator AI (leave as 0.0).
+        - error_flags: List of errors detected (leave as empty array []).
+        - needs_manual_review: Boolean indicating if review needed (leave as false).
+        - best_before_date: Best before date (date or 'fresh').
+        - label_language: Languages on label (e.g. 'UK text', 'SA label').
+        - ean_code: EAN product barcode.
+        - gift_box: Indicates if product includes gift box (GBX).
+        - refillable_status: REF/NRF: refillable or non‑refillable.
+        - custom_status: Customs status: T1 or T2.
+        - moq_cases: Minimum order quantity stated in the offer.
 
-    IMPORTANT RULES:
-    1. Extract ALL products mentioned in the text
-    2. For each product, extract ALL fields you can find in the text
-    3. If a field is NOT FOUND in the text, return EMPTY STRING "" for string fields and 0 for numeric fields
-    4. Do NOT use null or None - only empty strings "" or 0
-    5. Do NOT invent data - only extract what you see
-    6. Use AI to intelligently match values to fields - if something in email matches a field, extract it
-    PRICE INTERPRETATION:
-- "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
-- "11,40eur/btl" → price_per_unit: 11.40
-- "32,50eur/cs" → price_per_case: 32.50
+        IMPORTANT RULES:
+        1. Extract ALL products mentioned in the text. Return one object per product in the 'products' array.
+        2. CAPTURE FULL NAMES: 'Baileys Original' is the product_name, not just 'Original'.
+        3. If you find multiple quantities/prices for one product, create separate entries if they look like distinct offers.
+        4. If a field is NOT FOUND or doesn't exist, use "Not Found" for strings and 0 for numbers.
+        5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
+        6. Use AI to intelligently match values to fields - if something in email matches a field, extract it
+        PRICE INTERPRETATION:
+    - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
+    - "11,40eur/btl" → price_per_unit: 11.40
+    - "32,50eur/cs" → price_per_case: 32.50
 
-QUANTITY EXTRACTION:
-- "960 cs" → quantity_case: 960
-- "256cs x 3" → quantity_case: 768 (calculate: 256 × 3)
-- "1932cs" → quantity_case: 1932
-- If quantity not specified, leave as 0
-
-DATE FIELDS:
-- "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
-- "BBD 03.06.2026" → best_before_date: "2026-06-03"
-- "fresh" → best_before_date: "fresh"
-- These are NOT lead_time
-
-CUSTOM STATUS:
-- "T1" → custom_status: "T1"
-- "T2" → custom_status: "T2"
-
-PACKAGING_RAW:
-- "cans" → packaging_raw: "can"
-- "btls" or "bottle" → packaging_raw: "bottle"
-
-LABEL LANGUAGE:
-- Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
-- "UK text" → label_language: "EN"
-- "SA label" → label_language: "multiple" 
-- "multi text" → label_language: "multiple"
-- If not mentioned, leave as empty string ""
-
-    COMMON PATTERNS IN EMAILS:
-    - "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
-    - "6x70" → units_per_case: 6, unit_volume_ml: 700
-    - "24x50cl cans" → units_per_case: 24, unit_volume_ml: 500, bottle_or_can_type: "can"
+    QUANTITY EXTRACTION:
     - "960 cs" → quantity_case: 960
-    - "98,5€" → price_per_case: 98.5, currency: "EUR"
-    - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
-    - "EXW Loendersloot" → incoterm: "EXW", location: "Loendersloot bonded warehouse in Netherlands"
-    - "DAP LOE" → incoterm: "DAP", location: "Loendersloot bonded warehouse in Netherlands"
-    - "5 weeks LT" → lead_time: "5 weeks"
+    - "256cs x 3" → quantity_case: 768 (calculate: 256 × 3)
+    - "1932cs" → quantity_case: 1932
+    - If quantity not specified, leave as 0
+
+    DATE FIELDS:
+    - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
     - "BBD 03.06.2026" → best_before_date: "2026-06-03"
     - "fresh" → best_before_date: "fresh"
+    - These are NOT lead_time
+
+    CUSTOM STATUS:
+    - "T1" → custom_status: "T1"
+    - "T2" → custom_status: "T2"
+
+    PACKAGING_RAW:
+    - "cans" → packaging_raw: "can"
+    - "btls" or "bottle" → packaging_raw: "bottle"
+
+    LABEL LANGUAGE:
+    - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
     - "UK text" → label_language: "EN"
-    - "SA label" → label_language: "multiple"
-    - "T1" or "T2" → custom_status: "T1" or "T2"
-    - "REF" → refillable_status: "REF"
-    - "NRF" → refillable_status: "NRF"
+    - "SA label" → label_language: "multiple" 
+    - "multi text" → label_language: "multiple"
+    - If not mentioned, leave as empty string ""
 
-    CATEGORY DETECTION:
-    - Whisky/Whiskey/Scotch/Bourbon → category: "Spirits", sub_category: "Whisky"
-    - Champagne/Sparkling → category: "Wine", sub_category: "Champagne"
-    - Wine/Red/White → category: "Wine", sub_category: (red/white/rose)
-    - Beer/Lager/Ale → category: "Beer", sub_category: (lager/ale/stout)
-    - Cognac/Brandy → category: "Spirits", sub_category: "Brandy"
-    - Vodka/Gin/Rum → category: "Spirits", sub_category: (vodka/gin/rum)
-    - Liqueur → category: "Spirits", sub_category: "Liqueur"
-    - Soft Drinks/Energy Drinks → category: "Soft Drinks"
-    - Food → category: "Food"
+        COMMON PATTERNS IN EMAILS:
+        - "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
+        - "6x70" → units_per_case: 6, unit_volume_ml: 700
+        - "24x50cl cans" → units_per_case: 24, unit_volume_ml: 500, bottle_or_can_type: "can"
+        - "960 cs" → quantity_case: 960
+        - "98,5€" → price_per_case: 98.5, currency: "EUR"
+        - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
+        - "EXW Loendersloot" → incoterm: "EXW", location: "Loendersloot bonded warehouse in Netherlands"
+        - "DAP LOE" → incoterm: "DAP", location: "Loendersloot bonded warehouse in Netherlands"
+        - "5 weeks LT" → lead_time: "5 weeks"
+        - "BBD 03.06.2026" → best_before_date: "2026-06-03"
+        - "fresh" → best_before_date: "fresh"
+        - "UK text" → label_language: "EN"
+        - "SA label" → label_language: "multiple"
+        - "T1" or "T2" → custom_status: "T1" or "T2"
+        - "REF" → refillable_status: "REF"
+        - "NRF" → refillable_status: "NRF"
+        - (Missing Field) → "Not Found"
 
-    RETURN FORMAT:
-    {{
-      "products": [
-        {{
-          "uid": "",
-          "product_key": "BAILEYS_ORIGINAL_1000ML_BOTTLE",
-          "processing_version": "",
-          "brand": "Baileys",
-          "product_name": "Baileys Original",
-          "product_reference": "",
-          "category": "Spirits",
-          "sub_category": "Cream Liqueur",
-          "origin_country": "",
-          "vintage": "",
-          "alcohol_percent": 17,
-          "packaging": "12x1000ml Bottles",
-          "unit_volume_ml": 1000,
-          "units_per_case": 12,
-          "cases_per_pallet": 0,
-          "quantity_case": 960,
-          "bottle_or_can_type": "bottle",
-          "price_per_unit": 8.21,
-          "price_per_case": 98.5,
-          "currency": "EUR",
-          "price_per_unit_eur": 8.21,
-          "price_per_case_eur": 98.5,
-          "incoterm": "EXW",
-          "location": "Loendersloot bonded warehouse in Netherlands",
-          "min_order_quantity_case": 0,
-          "port": "",
-          "lead_time": "Available now",
-          "supplier_name": "",
-          "supplier_reference": "",
-          "supplier_country": "",
-          "offer_date": "",
-          "valid_until": "",
-          "date_received": "",
-          "source_channel": "",
-          "source_filename": "",
-          "source_message_id": "",
-          "confidence_score": 0.0,
-          "error_flags": [],
-          "needs_manual_review": false,
-          "best_before_date": "",
-          "label_language": "EN",
-          "ean_code": "",
-          "gift_box": "",
-          "refillable_status": "NRF",
-          "custom_status": "T2",
-          "moq_cases": 0
-        }}
-      ]
-    }}
+        CATEGORY DETECTION:
+        - Whisky/Whiskey/Scotch/Bourbon → category: "Spirits", sub_category: "Whisky"
+        - Champagne/Sparkling → category: "Wine", sub_category: "Champagne"
+        - Wine/Red/White → category: "Wine", sub_category: (red/white/rose)
+        - Beer/Lager/Ale → category: "Beer", sub_category: (lager/ale/stout)
+        - Cognac/Brandy → category: "Spirits", sub_category: "Brandy"
+        - Vodka/Gin/Rum → category: "Spirits", sub_category: (vodka/gin/rum)
+        - Liqueur → category: "Spirits", sub_category: "Liqueur"
+        - Soft Drinks/Energy Drinks → category: "Soft Drinks"
+        - Food → category: "Food"
 
-    Text:
-    {text}
-    """
+        Text Chunk ({idx + 1}/{len(text_chunks)}):
+        {chunk}
+        """
 
-    try:
-        logger.info("Calling OpenAI API for text extraction...")
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.1
-        )
+        try:
+            logger.info("Calling OpenAI API for text extraction chunk...")
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=4096
+            )
 
-        content = response.choices[0].message.content
-        logger.info(f"OpenAI response received, length: {len(content)}")
-        logger.debug(f"OpenAI response preview: {content[:200]}...")
+            content = response.choices[0].message.content
+            logger.info(f"OpenAI response received for chunk {idx + 1}, length: {len(content)}")
+            
+            result = json.loads(content)
+            products = result.get('products', [])
+            
+            cleaned_products = []
+            for product in products:
+                # Clean product nulls
+                for key in product:
+                    if product[key] is None:
+                        numeric_fields = [
+                            'unit_volume_ml', 'units_per_case', 'cases_per_pallet',
+                            'quantity_case', 'price_per_unit', 'price_per_unit_eur',
+                            'price_per_case', 'price_per_case_eur', 'fx_rate',
+                            'alcohol_percent', 'moq_cases'
+                        ]
+                        if key in numeric_fields:
+                            product[key] = 0
+                        else:
+                            product[key] = "Not Found"
+                            
+                cleaned_product = clean_product_data(product)
+                cleaned_products.append(cleaned_product)
 
-        result = json.loads(content)
-        logger.info(f"JSON parsed successfully, keys: {list(result.keys())}")
+            all_products.extend(cleaned_products)
+            logger.info(f"Chunk {idx + 1} yielded {len(cleaned_products)} products.")
 
-        null_count_before = sum(1 for v in result.values() if v is None)
-        if null_count_before > 0:
-            logger.warning(f"Found {null_count_before} null values in OpenAI response")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in extract_offer for chunk {idx + 1}: {e}")
+            continue
+        except Exception as e:
+            logger.error(f"Error extracting from text chunk {idx + 1}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            continue
 
-        for key in result:
-            if result[key] is None:
-                numeric_fields = [
-                    'unit_volume_ml', 'units_per_case', 'cases_per_pallet',
-                    'quantity_case', 'price_per_unit', 'price_per_unit_eur',
-                    'price_per_case', 'price_per_case_eur', 'fx_rate',
-                    'alcohol_percent', 'moq_cases'
-                ]
-
-                if key in numeric_fields:
-                    result[key] = 0
-                    logger.debug(f"Converted null to 0 for numeric field: {key}")
-                else:
-                    result[key] = ""
-                    logger.debug(f"Converted null to empty string for field: {key}")
-
-        logger.info(f"extract_offer completed successfully")
-        if 'products' not in result:
-            logger.warning("No 'products' key in response, creating empty array")
-            result = {'products': []}
-
-        products = result.get('products', [])
-        logger.info(f"Extracted {len(products)} products from text")
-
-        cleaned_products = []
-        for product in products:
-            cleaned_product = clean_product_data(product)
-            cleaned_products.append(cleaned_product)
-
-        result['products'] = cleaned_products
-
-        return result
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error in extract_offer: {e}")
-        logger.error(f"Raw content that failed to parse: {content[:500]}")
-        return {}
-    except Exception as e:
-        logger.error(f"Error extracting from text: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        return {}
+    logger.info(f"extract_offer completed successfully. Total products aggregated: {len(all_products)}")
+    return {"products": all_products}
 
 
 async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]:
@@ -354,67 +301,59 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     {json.dumps(data_rows, indent=2)}
 
                     SCHEMA DEFINITION - Use EXACTLY these field names:
-                    - uid: (leave empty)
+                    - uid: (leave as "Not Found")
                     - product_key: UPPERCASE(brand + name + volume + packaging)
-                    - processing_version: (leave empty)
-                    - brand: Brand name
-                    - product_name: Full product name
-                    - product_reference: Supplier reference
-                    - category: Main category (Wine, Spirits, Beer...)
-                    - sub_category: Sub-category
-                    - origin_country: Country of origin
-                    - vintage: Vintage year
-                    - alcohol_percent: Alcohol percentage
-                    - packaging: Packaging description
-                    - unit_volume_ml: Convert CL to ml (75CL = 750ml)
-                    - units_per_case: Number per case
-                    - cases_per_pallet: Cases per pallet
-                    - quantity_case: Quantity in cases
-                    - bottle_or_can_type: "bottle" or "can"
-                    - price_per_unit: Unit price
-                    - price_per_case: Case price
-                    - currency: Currency code
-                    - price_per_unit_eur: Unit price in EUR
-                    - price_per_case_eur: Case price in EUR
-                    - incoterm: Incoterm (EXW, DAP, etc.)
-                    - location: Warehouse location
-                    - min_order_quantity_case: MOQ in cases
-                    - port: Port if mentioned
-                    - lead_time: Lead time
-                    - supplier_name: (leave empty)
-                    - supplier_reference: Supplier reference
-                    - supplier_country: Supplier country
-                    - offer_date: (leave empty)
-                    - valid_until: Validity date
-                    - date_received: (leave empty)
-                    - source_channel: (leave empty)
-                    - source_filename: (leave empty)
-                    - source_message_id: (leave empty)
+                    - processing_version: (leave as "Not Found")
+                    - brand: Brand or trademark of the product.
+                    - product_name: Commercial product name.
+                    - product_reference: Supplier or internal reference/SKU.
+                    - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
+                    - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
+                    - origin_country: Country of origin (ISO 2 code or full name).
+                    - vintage: Vintage year (for wine/champagne).
+                    - alcohol_percent: Alcohol percentage if applicable.
+                    - packaging: Full packaging description (e.g. 6x750ml).
+                    - unit_volume_ml: Volume per unit in milliliters (convert CL).
+                    - units_per_case: Number of units per case.
+                    - cases_per_pallet: Number of cases per pallet.
+                    - quantity_case: Number of cases offered or ordered.
+                    - bottle_or_can_type: Packaging type (bottle/can/other).
+                    - price_per_unit: Unit price.
+                    - price_per_case: Case price.
+                    - currency: Currency (EUR, USD, GBP...).
+                    - price_per_unit_eur: Unit price in EUR.
+                    - price_per_case_eur: Case price in EUR.
+                    - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
+                    - location: Location/port.
+                    - min_order_quantity_case: Minimum order quantity in cases.
+                    - port: Port of loading/destination if applicable.
+                    - lead_time: Lead time or availability.
+                    - supplier_name: (leave as "Not Found").
+                    - supplier_reference: Supplier offer reference.
+                    - supplier_country: Supplier's country.
+                    - offer_date: (leave as "Not Found").
+                    - valid_until: Offer validity date.
+                    - date_received: (leave as "Not Found").
+                    - source_channel: (leave as "Not Found").
+                    - source_filename: (leave as "Not Found").
+                    - source_message_id: (leave as "Not Found").
                     - confidence_score: (leave 0.0)
                     - error_flags: (leave empty array [])
                     - needs_manual_review: (leave false)
-                    - best_before_date: BBD
+                    - best_before_date: Best before date (BBD)
                     - label_language: Label language
-                    - ean_code: EAN barcode
-                    - gift_box: "GBX" or empty
-                    - refillable_status: "REF" or "NRF"
-                    - custom_status: "T1" or "T2"
-                    - moq_cases: MOQ in cases
+                    - ean_code: EAN product barcode
+                    - gift_box: Indicates if includes gift box (GBX)
+                    - refillable_status: REF/NRF
+                    - custom_status: Customs status: T1 or T2
+                    - moq_cases: Minimum order quantity stated in the offer.
 
-                    MAPPING FROM EXCEL COLUMNS:
-                    - Description → product_name, brand
-                    - REF/NRF → refillable_status
-                    - GB/WGB → origin_country: "United Kingdom"
-                    - CL → unit_volume_ml (×10)
-                    - BTL → units_per_case
-                    - Alc,% → alcohol_percent
-                    - D → supplier_reference
-                    - Qty CS → quantity_case
-                    - Price EUR/CS → price_per_case
-                    - Date → valid_until (if not 'STOCK')
-                    - Incoterms/Warehouse → location and incoterm
-                    - GCP → location: 'Grupo Corporativo Pérez bonded warehouse in Panama', incoterm: 'DAP'
-                    - LOE → location: 'Loendersloot bonded warehouse in Netherlands', incoterm: 'DAP'
+                    MAPPING FROM EXCEL DATA:
+                    - Ensure you capture the full product name and brand.
+                    - If a row is clearly a product offer, extract it.
+                    - If a row is just a subtotal or header, skip it.
+                    - If a field is NOT FOUND or doesn't exist, use "Not Found" for strings and 0 for numbers.
+                    - NEVER return empty string "" for missing values, always use "Not Found".
                     
                     PRICE INTERPRETATION:
                     - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
@@ -461,25 +400,24 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     try:
                         logger.info(f"Calling OpenAI API for batch {batch_start // batch_size + 1}...")
                         response = await client.chat.completions.create(
-                            model="gpt-4o-mini",
+                            model="gpt-4o",
                             messages=[
                                 {
                                     "role": "system",
-                                    "content": f"You extract commercial alcohol product data from Excel. Return COMPLETE JSON with 'products' array containing EXACTLY {len(batch_df)} products. NEVER skip rows. Create a product for every row even if some data is missing."
+                                    "content": f"You are a professional data extraction expert. You extract commercial alcohol product data from Excel. Return COMPLETE JSON with 'products' array containing EXACTLY {len(batch_df)} products. NEVER skip rows. Create a product for every row even if data is missing, using logical defaults."
                                 },
                                 {"role": "user", "content": batch_text}
                             ],
                             response_format={"type": "json_object"},
-                            temperature=0.1,
-                            max_tokens=10000,
-                            top_p=0.95,
+                            temperature=0.0,
+                            max_tokens=4096,
+                            top_p=1.0,
                             frequency_penalty=0.0,
                             presence_penalty=0.0
                         )
 
                         content = response.choices[0].message.content
                         logger.info(f"Batch {batch_start // batch_size + 1} OpenAI response length: {len(content)}")
-                        logger.debug(f"Batch {batch_start // batch_size + 1} response preview: {content[:200]}...")
 
                         if not content.strip().endswith('}'):
                             logger.warning(
@@ -693,15 +631,12 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
                 response = await client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o",
                     messages=[
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": """You extract commercial alcohol product data from Excel 
-                                using the exact schema provided. Return COMPLETE JSON with 'products' array containing 
-                                EXACTLY {len(batch_df)} products. Use AI to best match values from Excel to schema fields. 
-                                If a field is not found, use empty string or 0. NEVER skip rows."""},
+                                {"type": "text", "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema."},
                                 {
                                     "type": "image_url",
                                     "image_url": f"data:{content_type};base64,{base64_image}",
@@ -709,7 +644,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                             ],
                         }
                     ],
-                    max_tokens=1000,
+                    max_tokens=4096,
                 )
                 logger.info("Image processed with OpenAI")
                 return await extract_offer(response.choices[0].message.content)
@@ -753,51 +688,51 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
 def clean_product_data(product: dict) -> dict:
     """Clean up product data to ensure it matches schema exactly"""
     schema_fields = {
-        'uid': '',
-        'product_key': '',
-        'processing_version': '',
-        'brand': '',
-        'product_name': '',
-        'product_reference': '',
-        'category': '',
-        'sub_category': '',
-        'origin_country': '',
-        'vintage': '',
+        'uid': 'Not Found',
+        'product_key': 'Not Found',
+        'processing_version': 'Not Found',
+        'brand': 'Not Found',
+        'product_name': 'Not Found',
+        'product_reference': 'Not Found',
+        'category': 'Not Found',
+        'sub_category': 'Not Found',
+        'origin_country': 'Not Found',
+        'vintage': 'Not Found',
         'alcohol_percent': 0,
-        'packaging': '',
+        'packaging': 'Not Found',
         'unit_volume_ml': 0,
         'units_per_case': 0,
         'cases_per_pallet': 0,
         'quantity_case': 0,
-        'bottle_or_can_type': '',
+        'bottle_or_can_type': 'Not Found',
         'price_per_unit': 0,
         'price_per_case': 0,
         'currency': 'EUR',
         'price_per_unit_eur': 0,
         'price_per_case_eur': 0,
-        'incoterm': '',
-        'location': '',
+        'incoterm': 'Not Found',
+        'location': 'Not Found',
         'min_order_quantity_case': 0,
-        'port': '',
-        'lead_time': '',
-        'supplier_name': '',
-        'supplier_reference': '',
-        'supplier_country': '',
-        'offer_date': '',
-        'valid_until': '',
-        'date_received': '',
-        'source_channel': '',
-        'source_filename': '',
-        'source_message_id': '',
+        'port': 'Not Found',
+        'lead_time': 'Not Found',
+        'supplier_name': 'Not Found',
+        'supplier_reference': 'Not Found',
+        'supplier_country': 'Not Found',
+        'offer_date': 'Not Found',
+        'valid_until': 'Not Found',
+        'date_received': 'Not Found',
+        'source_channel': 'Not Found',
+        'source_filename': 'Not Found',
+        'source_message_id': 'Not Found',
         'confidence_score': 0.0,
         'error_flags': [],
         'needs_manual_review': False,
-        'best_before_date': '',
-        'label_language': 'EN',
-        'ean_code': '',
-        'gift_box': '',
+        'best_before_date': 'Not Found',
+        'label_language': 'Not Found',
+        'ean_code': 'Not Found',
+        'gift_box': 'Not Found',
         'refillable_status': 'NRF',
-        'custom_status': '',
+        'custom_status': 'Not Found',
         'moq_cases': 0
     }
 
@@ -810,8 +745,12 @@ def clean_product_data(product: dict) -> dict:
             if value is None:
                 if isinstance(default_value, (int, float)):
                     cleaned_product[field] = 0
+                elif isinstance(default_value, list):
+                    cleaned_product[field] = []
+                elif isinstance(default_value, bool):
+                    cleaned_product[field] = False
                 else:
-                    cleaned_product[field] = ""
+                    cleaned_product[field] = "Not Found"
             else:
                 if isinstance(default_value, (int, float)):
                     try:
@@ -819,7 +758,7 @@ def clean_product_data(product: dict) -> dict:
                     except (ValueError, TypeError):
                         cleaned_product[field] = 0
                 else:
-                    cleaned_product[field] = str(value) if value is not None else ""
+                    cleaned_product[field] = str(value) if value not in [None, "", "null"] else "Not Found"
         else:
             cleaned_product[field] = default_value
 

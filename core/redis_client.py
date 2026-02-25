@@ -13,7 +13,7 @@ class RedisManager:
         self.client = None
 
         try:
-            REDIS_URL = os.getenv("REDIS_URL")
+            REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
             if REDIS_URL and (":10000" in REDIS_URL or "clustered=true" in REDIS_URL):
                 import urllib.parse
 

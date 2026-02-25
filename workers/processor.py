@@ -9,8 +9,30 @@ from core.redis_client import redis_manager
 import tempfile
 import os
 import logging
+from core.webhook_client import send_consolidated_webhook
 
 logger = logging.getLogger(__name__)
+
+def is_valid_offer(offer_dict: dict) -> bool:
+    """Strict validation for extracted offers"""
+    if not offer_dict:
+        return False
+    
+    name = offer_dict.get('product_name')
+    if not name or name in ["Not Found", "Unknown", "Row", ""]:
+        return False
+        
+    # Basic data sanity checks
+    if name.lower().startswith('row '): # Skip generic placeholders
+        return False
+        
+    # Check for minimal commercial data
+    if offer_dict.get('price_per_unit') == 0 and offer_dict.get('price_per_case') == 0:
+        # If no price is found, it's often a false positive or truncated data
+        logger.debug(f"Offer {name} rejected: No price data found.")
+        return False
+
+    return True
 
 
 async def process_offer(payload, job_id: str):
@@ -18,6 +40,9 @@ async def process_offer(payload, job_id: str):
         uid = str(uuid.uuid4())
         extracted_data = {}
         all_products = []
+        processed_keys = set() # For deduplication
+        valid_count = 0
+        duplicate_count = 0
 
         redis_manager.set_job_status(job_id, "processing")
 
@@ -99,6 +124,7 @@ async def process_offer(payload, job_id: str):
             for idx, product_data in enumerate(all_products):
                 try:
                     merged_data = {**extracted_data, **product_data}
+                    logger.debug(f"Row {idx} raw data before cleaning: {merged_data.get('product_name')} | {merged_data.get('brand')}")
 
                     safe_data = {
                         'product_name': merged_data.get('product_name') or "Not Found",
@@ -191,18 +217,42 @@ async def process_offer(payload, job_id: str):
                         attachment_filenames=[att.fileName for att in
                                               payload.attachments] if payload.attachments else [],
                         attachment_count=len(payload.attachments) if payload.attachments else 0,
-                        confidence_score=0.85,
+                        confidence_score=0.95,
                         needs_manual_review=False,
                         error_flags=[],
                         custom_status=None,
-                        processing_version="1.0.0",
+                        processing_version="2.0.0",
                         ean_code=safe_data['ean_code'],
                         label_language=safe_data['label_language'],
                         product_reference=safe_data['product_reference'],
                     )
 
-                    offers.append(offer.model_dump(mode='json'))
-                    logger.info(f"Created offer {idx + 1}/{len(all_products)}: {safe_data['product_name']}")
+                    offer_dict = offer.model_dump(mode='json')
+                    
+                    # Validation & Deduplication
+                    if is_valid_offer(offer_dict):
+                        p_key = offer_dict.get('product_key', '')
+                        if p_key not in processed_keys:
+                            processed_keys.add(p_key)
+                            offers.append(offer_dict)
+                            valid_count += 1
+                            # Sequential Webhook Dispatch - Structured product collection for visibility
+                            logger.info(f"Dispatching sequential webhook for product: {offer_dict['product_name']}")
+                            send_consolidated_webhook(
+                                job_id=job_id,
+                                payload_type="single_row",
+                                data={"product": offer_dict},
+                                delivery_id=f"{job_id}_{valid_count}"
+                            )
+                        else:
+                            duplicate_count += 1
+                            brand = offer_dict.get('brand', 'Not Found')
+                            p_name = offer_dict.get('product_name', 'Not Found')
+                            logger.info(f"Skipping duplicate product in sheet: {brand} | {p_name} (Key: {p_key})")
+                    else:
+                        brand = offer_dict.get('brand', 'Not Found')
+                        p_name = offer_dict.get('product_name', 'Not Found')
+                        logger.warning(f"Skipping row {idx} - Invalid/Incomplete commercial data: {brand} | {p_name}")
 
                 except Exception as e:
                     error_trace = traceback.format_exc()
@@ -302,18 +352,28 @@ async def process_offer(payload, job_id: str):
                     source_filename=payload.source_filename,
                     attachment_filenames=[att.fileName for att in payload.attachments] if payload.attachments else [],
                     attachment_count=len(payload.attachments) if payload.attachments else 0,
-                    confidence_score=0.85,
+                    confidence_score=0.95,
                     needs_manual_review=False,
                     error_flags=[],
                     custom_status=None,
-                    processing_version="1.0.0",
+                    processing_version="2.0.0",
                     ean_code=safe_data['ean_code'],
                     label_language=safe_data['label_language'],
                     product_reference=safe_data['product_reference'],
                 )
 
-                offers.append(offer.model_dump(mode='json'))
-                logger.info(f"Successfully created single offer for job {job_id}")
+                offer_dict = offer.model_dump(mode='json')
+                if is_valid_offer(offer_dict):
+                    offers.append(offer_dict)
+                    logger.info(f"Dispatching sequential webhook for single offer: {offer_dict['product_name']}")
+                    send_consolidated_webhook(
+                        job_id=job_id,
+                        payload_type="single_row",
+                        data={"product": offer_dict},
+                        delivery_id=f"{job_id}_single"
+                    )
+                else:
+                    logger.warning(f"Single offer extraction failed validation: {offer_dict.get('product_name')}")
 
             except Exception as e:
                 error_trace = traceback.format_exc()
@@ -325,6 +385,7 @@ async def process_offer(payload, job_id: str):
                     "error": str(e),
                     "error_trace": error_trace,
                     "extracted_data": extracted_data,
+                    "duplicate_count": duplicate_count,
                     "source_data": {
                         "supplier_name": payload.supplier_name,
                         "supplier_email": payload.supplier_email,
@@ -344,6 +405,7 @@ async def process_offer(payload, job_id: str):
             "job_id": job_id,
             "status": "done",
             "total_products": len(offers),
+            "duplicate_count": duplicate_count,
             "products": offers,
             "source_info": {
                 "supplier": payload.supplier_name,
