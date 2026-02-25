@@ -1,5 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+from core.logging_utils import setup_logging
+
+# Initialize global logging to stdout for Azure visibility
+setup_logging(level=logging.DEBUG)
 
 from api.ingest import router as ingest_router
 from api.results import router as results_router

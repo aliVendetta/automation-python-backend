@@ -4,6 +4,11 @@ import traceback
 import asyncio
 from datetime import datetime
 from pydantic import ValidationError
+import logging
+from core.logging_utils import setup_logging
+
+# Initialize global logging to stdout for Azure visibility
+setup_logging(level=logging.INFO)
 
 from core.celery_app import celery_app
 from workers.processor import process_offer

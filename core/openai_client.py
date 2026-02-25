@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 import logging
 import traceback
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Root logging configured in entry points
 logger = logging.getLogger(__name__)
 
 load_dotenv()
