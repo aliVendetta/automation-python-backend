@@ -1,12 +1,13 @@
 import os
 from celery import Celery
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+broker_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+result_backend = os.getenv("CELERY_RESULT_BACKEND", broker_url)
 
 celery_app = Celery(
     "automation_backend",
-    broker=REDIS_URL,
-    backend=REDIS_URL,
+    broker=broker_url,
+    backend=result_backend,
     include=["workers.celery_tasks"]
 )
 
@@ -18,5 +19,5 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_time_limit=3600,
-    broker_connection_retry_on_startup=True
+    broker_connection_retry_on_startup=True,
 )
