@@ -7,6 +7,8 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import logging
 import traceback
+import re
+from datetime import datetime
 
 # Root logging configured in entry points
 logger = logging.getLogger(__name__)
@@ -14,6 +16,54 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+async def get_exchange_rate_to_eur(currency: str) -> float:
+    """Get exchange rate from any currency to EUR using OpenAI"""
+    if currency in ["Not Found", "", None, "EUR"]:
+        return 1.0
+
+    try:
+        logger.info(f"Getting exchange rate for {currency} to EUR")
+
+        prompt = f"""
+        What is the current exchange rate from {currency} to EUR (Euro)?
+        Return ONLY a JSON object with the exchange rate as a float number.
+        Example: {{"rate": 0.85}} for USD to EUR
+        Use the most recent reliable exchange rate.
+        """
+
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=100
+        )
+
+        content = response.choices[0].message.content
+        result = json.loads(content)
+        rate = float(result.get('rate', 1.0))
+
+        logger.info(f"Exchange rate for {currency} to EUR: {rate}")
+        return rate
+
+    except Exception as e:
+        logger.error(f"Error getting exchange rate for {currency}: {e}")
+        return 1.0
+
+
+def convert_price_to_eur(price, currency, exchange_rate):
+    """Convert price to EUR using exchange rate"""
+    if price in [None, "Not Found", "", 0, "0"]:
+        return None
+    try:
+        price_float = float(price)
+        if price_float == 0:
+            return None
+        return round(price_float * exchange_rate, 2)
+    except (ValueError, TypeError):
+        return None
 
 
 async def extract_offer(text: str) -> dict:
@@ -60,9 +110,9 @@ async def extract_offer(text: str) -> dict:
         - bottle_or_can_type: Packaging type (bottle/can/other).
         - price_per_unit: Unit price.
         - price_per_case: Case price.
-        - currency: Currency (EUR, USD, GBP...).
-        - price_per_unit_eur: Unit price converted into EUR.
-        - price_per_case_eur: Case price converted into EUR.
+        - currency: Currency (EUR, USD, GBP...). Extract this from the text - look for currency symbols (€, $, £) or currency codes.
+        - price_per_unit_eur: Unit price converted into EUR. (Leave as "Not Found" - will be calculated later)
+        - price_per_case_eur: Case price converted into EUR. (Leave as "Not Found" - will be calculated later)
         - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
         - location: Location/port associated with the incoterm.
         - min_order_quantity_case: Minimum order quantity in cases.
@@ -110,9 +160,12 @@ async def extract_offer(text: str) -> dict:
         7. Use AI to intelligently match values to fields - if something in email matches a field, extract it
 
         PRICE INTERPRETATION:
-        - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
-        - "11,40eur/btl" → price_per_unit: 11.40
-        - "32,50eur/cs" → price_per_case: 32.50
+        - "15.95eur" → price_per_case: 15.95, currency: "EUR" (when no /btl or /cs suffix, assume per case)
+        - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
+        - "32,50eur/cs" → price_per_case: 32.50, currency: "EUR"
+        - "$15.95" → price_per_case: 15.95, currency: "USD" (when no /btl or /cs suffix, assume per case)
+        - "£11.40/btl" → price_per_unit: 11.40, currency: "GBP"
+        - Always extract the currency from the price notation (€, $, £, EUR, USD, GBP, etc.)
 
         QUANTITY EXTRACTION:
         - "960 cs" → quantity_case: 960
@@ -190,6 +243,8 @@ async def extract_offer(text: str) -> dict:
         - "960 cs" → quantity_case: 960
         - "98,5€" → price_per_case: 98.5, currency: "EUR"
         - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
+        - "$15.95/btl" → price_per_unit: 15.95, currency: "USD"
+        - "£32.50/cs" → price_per_case: 32.50, currency: "GBP"
         - "EXW Loendersloot" → incoterm: "EXW", location: "Loendersloot bonded warehouse in Netherlands"
         - "DAP LOE" → incoterm: "DAP", location: "Loendersloot bonded warehouse in Netherlands"
         - "5 weeks LT" → lead_time: "5 weeks"
@@ -218,6 +273,7 @@ async def extract_offer(text: str) -> dict:
         - Only extract what is explicitly stated. 
         - If a value is 0, that means "Not Found" - treat as "Not Found".
         - Use "Not Found" for ALL missing fields - both strings AND numbers.
+        - IMPORTANT: Extract the currency from price notations (€, $, £, EUR, USD, GBP, etc.)
 
         Text Chunk ({idx + 1}/{len(text_chunks)}):
         {chunk}
@@ -268,6 +324,40 @@ async def extract_offer(text: str) -> dict:
             logger.error(f"Error extracting from text chunk {idx + 1}: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             continue
+
+    # After extracting all products, convert prices to EUR
+    logger.info("Converting prices to EUR for all products...")
+    for product in all_products:
+        currency = product.get('currency', "Not Found")
+
+        # Skip if currency is not found or already EUR
+        if currency in ["Not Found", "", None, "EUR"]:
+            product['price_per_unit_eur'] = product.get('price_per_unit')
+            product['price_per_case_eur'] = product.get('price_per_case')
+            continue
+
+        # Get exchange rate for this currency
+        exchange_rate = await get_exchange_rate_to_eur(currency)
+
+        # Convert unit price if exists
+        if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+            product['price_per_unit_eur'] = convert_price_to_eur(
+                product['price_per_unit'],
+                currency,
+                exchange_rate
+            )
+
+        # Convert case price if exists
+        if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+            product['price_per_case_eur'] = convert_price_to_eur(
+                product['price_per_case'],
+                currency,
+                exchange_rate
+            )
+
+        logger.debug(f"Converted {currency} to EUR for product {product.get('product_name')}: "
+                     f"rate={exchange_rate}, unit_eur={product.get('price_per_unit_eur')}, "
+                     f"case_eur={product.get('price_per_case_eur')}")
 
     logger.info(f"extract_offer completed successfully. Total products aggregated: {len(all_products)}")
     return {"products": all_products}
@@ -383,9 +473,9 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - bottle_or_can_type: Packaging type (bottle/can/other).
                     - price_per_unit: Unit price.
                     - price_per_case: Case price.
-                    - currency: Currency (EUR, USD, GBP...).
-                    - price_per_unit_eur: Unit price in EUR.
-                    - price_per_case_eur: Case price in EUR.
+                    - currency: Currency (EUR, USD, GBP...). Extract from price columns if present.
+                    - price_per_unit_eur: Unit price in EUR. (Leave as "Not Found" - will be calculated later)
+                    - price_per_case_eur: Case price in EUR. (Leave as "Not Found" - will be calculated later)
                     - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
                     - location: Location/port.
                     - min_order_quantity_case: Minimum order quantity in cases.
@@ -432,9 +522,11 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - DO NOT use null for any field - always use "Not Found" for missing values.
 
                     PRICE INTERPRETATION:
-                    - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
-                    - "11,40eur/btl" → price_per_unit: 11.40
-                    - "32,50eur/cs" → price_per_case: 32.50
+                    - "15.95eur" → price_per_case: 15.95, currency: "EUR" (when no /btl or /cs suffix, assume per case)
+                    - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
+                    - "32,50eur/cs" → price_per_case: 32.50, currency: "EUR"
+                    - "$15.95" → price_per_case: 15.95, currency: "USD" (when no /btl or /cs suffix, assume per case)
+                    - Always extract currency from price notations
 
                     QUANTITY EXTRACTION:
                     - "960 cs" → quantity_case: 960
@@ -511,6 +603,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - Only extract what is explicitly stated. 
                     - If a value is 0, that means "Not Found" - treat as "Not Found".
                     - Use "Not Found" for ALL missing fields - both strings AND numbers.
+                    - IMPORTANT: Extract currency from price columns where present.
 
                     RETURN FORMAT:
                     {{
@@ -692,6 +785,35 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     logger.debug(
                         f"Sample extracted products (first 2): {json.dumps(all_extracted_products[:2], indent=2)}")
                     logger.info(f"Total extracted products after fixes: {len(all_extracted_products)}")
+
+                    # Convert prices to EUR for all extracted products
+                    logger.info("Converting prices to EUR for all Excel products...")
+                    for product in all_extracted_products:
+                        currency = product.get('currency', "Not Found")
+
+                        # Skip if currency is not found or already EUR
+                        if currency in ["Not Found", "", None, "EUR"]:
+                            product['price_per_unit_eur'] = product.get('price_per_unit')
+                            product['price_per_case_eur'] = product.get('price_per_case')
+                            continue
+
+                        exchange_rate = await get_exchange_rate_to_eur(currency)
+
+                        # Convert unit price if exists
+                        if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+                            product['price_per_unit_eur'] = convert_price_to_eur(
+                                product['price_per_unit'],
+                                currency,
+                                exchange_rate
+                            )
+
+                        # Convert case price if exists
+                        if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+                            product['price_per_case_eur'] = convert_price_to_eur(
+                                product['price_per_case'],
+                                currency,
+                                exchange_rate
+                            )
                 else:
                     logger.warning("No products extracted from any batch, trying fallback...")
                     simplified_rows = []
@@ -707,6 +829,24 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     logger.info(f"Fallback text content length: {len(text_content)}")
                     fallback_result = await extract_offer(text_content)
                     logger.info(f"Fallback extraction result type: {type(fallback_result)}")
+
+                    if isinstance(fallback_result, dict) and 'products' in fallback_result:
+                        for product in fallback_result['products']:
+                            if product.get('currency') not in ["Not Found", "", None, "EUR"]:
+                                exchange_rate = await get_exchange_rate_to_eur(product.get('currency'))
+                                if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+                                    product['price_per_unit_eur'] = convert_price_to_eur(
+                                        product['price_per_unit'],
+                                        product.get('currency'),
+                                        exchange_rate
+                                    )
+                                if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+                                    product['price_per_case_eur'] = convert_price_to_eur(
+                                        product['price_per_case'],
+                                        product.get('currency'),
+                                        exchange_rate
+                                    )
+
                     return fallback_result
 
                 if all_extracted_products:
@@ -762,7 +902,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                             "role": "user",
                             "content": [
                                 {"type": "text",
-                                 "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema."},
+                                 "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema. Make sure to extract the currency from any price notations (€, $, £, EUR, USD, GBP, etc.)"},
                                 {
                                     "type": "image_url",
                                     "image_url": f"data:{content_type};base64,{base64_image}",
@@ -773,7 +913,26 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     max_tokens=4096,
                 )
                 logger.info("Image processed with OpenAI")
-                return await extract_offer(response.choices[0].message.content)
+                result = await extract_offer(response.choices[0].message.content)
+
+                if isinstance(result, dict) and 'products' in result:
+                    for product in result['products']:
+                        if product.get('currency') not in ["Not Found", "", None, "EUR"]:
+                            exchange_rate = await get_exchange_rate_to_eur(product.get('currency'))
+                            if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+                                product['price_per_unit_eur'] = convert_price_to_eur(
+                                    product['price_per_unit'],
+                                    product.get('currency'),
+                                    exchange_rate
+                                )
+                            if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+                                product['price_per_case_eur'] = convert_price_to_eur(
+                                    product['price_per_case'],
+                                    product.get('currency'),
+                                    exchange_rate
+                                )
+
+                return result
 
             except Exception as e:
                 logger.error(f"Error extracting from image: {e}")
