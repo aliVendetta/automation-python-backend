@@ -824,21 +824,21 @@ def clean_product_data(product: dict) -> dict:
         'sub_category': "Not Found",
         'origin_country': "Not Found",
         'vintage': "Not Found",
-        'alcohol_percent': "Not Found",
+        'alcohol_percent': None,  # Changed from "Not Found" to None for numeric fields
         'packaging': "Not Found",
-        'unit_volume_ml': "Not Found",
-        'units_per_case': "Not Found",
-        'cases_per_pallet': "Not Found",
-        'quantity_case': "Not Found",
+        'unit_volume_ml': None,  # Changed from "Not Found" to None for numeric fields
+        'units_per_case': None,  # Changed from "Not Found" to None for numeric fields
+        'cases_per_pallet': None,  # Changed from "Not Found" to None for numeric fields
+        'quantity_case': None,  # Changed from "Not Found" to None for numeric fields
         'bottle_or_can_type': "Not Found",
-        'price_per_unit': "Not Found",
-        'price_per_case': "Not Found",
+        'price_per_unit': None,  # Changed from "Not Found" to None for numeric fields
+        'price_per_case': None,  # Changed from "Not Found" to None for numeric fields
         'currency': "EUR",
-        'price_per_unit_eur': "Not Found",
-        'price_per_case_eur': "Not Found",
+        'price_per_unit_eur': None,  # Changed from "Not Found" to None for numeric fields
+        'price_per_case_eur': None,  # Changed from "Not Found" to None for numeric fields
         'incoterm': "Not Found",
         'location': "Not Found",
-        'min_order_quantity_case': "Not Found",
+        'min_order_quantity_case': None,  # Changed from "Not Found" to None for numeric fields
         'port': "Not Found",
         'lead_time': "Not Found",
         'supplier_name': "Not Found",
@@ -859,7 +859,7 @@ def clean_product_data(product: dict) -> dict:
         'gift_box': "Not Found",
         'refillable_status': "NRF",
         'custom_status': "Not Found",
-        'moq_cases': "Not Found"
+        'moq_cases': None  # Changed from "Not Found" to None for numeric fields
     }
 
     cleaned_product = {}
@@ -868,9 +868,9 @@ def clean_product_data(product: dict) -> dict:
         if field in product:
             value = product[field]
 
-            # Convert None, empty strings, null, and 0 to "Not Found"
+            # Convert None, empty strings, null, and 0 to appropriate default
             if value in [None, "Not Found", "", "null", 0, "0"]:
-                cleaned_product[field] = "Not Found"
+                cleaned_product[field] = default_value
             else:
                 numeric_keys = [
                     'unit_volume_ml', 'units_per_case', 'cases_per_pallet',
@@ -886,13 +886,13 @@ def clean_product_data(product: dict) -> dict:
                         else:
                             cleaned_product[field] = float(value)
                     except (ValueError, TypeError):
-                        cleaned_product[field] = "Not Found"
+                        cleaned_product[field] = None  # Use None for failed conversions
                 elif isinstance(default_value, list):
                     cleaned_product[field] = value if isinstance(value, list) else []
                 elif isinstance(default_value, bool):
                     cleaned_product[field] = bool(value)
                 else:
-                    cleaned_product[field] = str(value) if value is not None else "Not Found"
+                    cleaned_product[field] = str(value) if value is not None else default_value
         else:
             cleaned_product[field] = default_value
 
@@ -902,7 +902,7 @@ def clean_product_data(product: dict) -> dict:
                                                                                                                     '').upper()
         cleaned_product['product_key'] = product_key
 
-    # Convert any 0 values to "Not Found" for numeric fields that shouldn't have 0 as a valid value
+    # Convert any 0 values to None for numeric fields that shouldn't have 0 as a valid value
     numeric_fields_never_zero = [
         'cases_per_pallet', 'quantity_case', 'moq_cases',
         'alcohol_percent', 'unit_volume_ml', 'units_per_case'
@@ -910,7 +910,7 @@ def clean_product_data(product: dict) -> dict:
 
     for field in numeric_fields_never_zero:
         if field in cleaned_product and cleaned_product[field] == 0:
-            cleaned_product[field] = "Not Found"
+            cleaned_product[field] = None
 
     return cleaned_product
 
