@@ -22,7 +22,6 @@ def is_valid_offer(offer_dict: dict) -> bool:
     if not name or name in ["Not Found", "Unknown", "Row", ""]:
         return False
         
-    # Basic data sanity checks
     if name.lower().startswith('row '): # Skip generic placeholders
         return False
         

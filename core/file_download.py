@@ -12,11 +12,6 @@ async def resolve_attachment_bytes(attachment: Attachment) -> bytes:
     if "url" in attachment.data:
         media_url = attachment.data["url"]
 
-        media_url = media_url.replace(
-            "https://lookaside.fbsbx.com",
-            "https://waba-v2.360dialog.io"
-        )
-
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 media_url,
