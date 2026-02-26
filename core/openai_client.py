@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 import logging
 import traceback
 
-
 # Root logging configured in entry points
 logger = logging.getLogger(__name__)
 
@@ -24,16 +23,17 @@ async def extract_offer(text: str) -> dict:
     # Maximum characters per chunk to prevent context overflow (roughly 5000 tokens)
     # Using characters vs tokens as a rough generic heuristic
     CHUNK_SIZE = 25000
-    
+
     # Split text into manageable chunks
-    text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)] if len(text) > CHUNK_SIZE else [text]
+    text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)] if len(text) > CHUNK_SIZE else [
+        text]
     logger.info(f"Split input text into {len(text_chunks)} chunk(s).")
-    
+
     all_products = []
-    
+
     for idx, chunk in enumerate(text_chunks):
         logger.info(f"Processing chunk {idx + 1} of {len(text_chunks)}...")
-        
+
         prompt = f"""
         You are extracting commercial alcohol offers from text.
         Return JSON ONLY, no explanation.
@@ -92,58 +92,59 @@ async def extract_offer(text: str) -> dict:
         1. Extract ALL products mentioned in the text. Return one object per product in the 'products' array.
         2. CAPTURE FULL NAMES: 'Baileys Original' is the product_name, not just 'Original'.
         3. If you find multiple quantities/prices for one product, create separate entries if they look like distinct offers.
-        4. If a field is NOT FOUND or doesn't exist, use "Not Found" for strings and 0 for numbers.
-        5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
+        4. If a field is NOT FOUND or doesn't exist, use null (NOT "Not Found" and NOT 0).
+        5. DO NOT leave string fields as empty string "" - if missing, use null.
         6. Use AI to intelligently match values to fields - if something in email matches a field, extract it
+
         PRICE INTERPRETATION:
-    - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
-    - "11,40eur/btl" → price_per_unit: 11.40
-    - "32,50eur/cs" → price_per_case: 32.50
+        - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
+        - "11,40eur/btl" → price_per_unit: 11.40
+        - "32,50eur/cs" → price_per_case: 32.50
 
-    QUANTITY EXTRACTION:
-    - "960 cs" → quantity_case: 960
-    - "256cs x 3" → quantity_case: 768 (calculate: 256 × 3)
-    - "1932cs" → quantity_case: 1932
-    - If quantity not specified, return null. Do NOT default to 0.
-    - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
+        QUANTITY EXTRACTION:
+        - "960 cs" → quantity_case: 960
+        - "256cs x 3" → quantity_case: 768 (calculate: 256 × 3)
+        - "1932cs" → quantity_case: 1932
+        - If quantity not specified, return null. Do NOT default to 0.
+        - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
 
-    ALCOHOL PERCENT:
-    - If input contains "40%" -> alcohol_percent: 40
-    - If input contains "5%" -> alcohol_percent: 5
-    - If already numeric, keep it unchanged. NEVER multiply by 100.
-    - If missing, return null.
+        ALCOHOL PERCENT:
+        - If input contains "40%" → alcohol_percent: 40
+        - If input contains "5%" → alcohol_percent: 5
+        - If already numeric, keep it unchanged. NEVER multiply by 100.
+        - If missing, return null.
 
-    SUPPLIER NAME EXTRACTION:
-    - Attempt to extract in this exact priority:
-      1. Extract from file content itself.
-      2. Extract from email body (e.g., "Offer from MILANAKO company").
-      3. Extract from forwarded email signature block.
-    - If none found in those places, return null. DO NOT default to the email sender.
+        SUPPLIER NAME EXTRACTION:
+        - Attempt to extract in this exact priority:
+          1. Extract from file content itself.
+          2. Extract from email body (e.g., "Offer from MILANAKO company").
+          3. Extract from forwarded email signature block.
+        - If none found in those places, return null. DO NOT default to the email sender.
 
-    INCOTERM & LOCATION:
-    - Example: "FCA Prague" -> incoterm: "FCA", location: "Prague"
-    - If no incoterm or location found, return null.
+        INCOTERM & LOCATION:
+        - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
+        - If no incoterm or location found, return null.
 
-    DATE FIELDS:
-    - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
-    - "BBD 03.06.2026" → best_before_date: "2026-06-03"
-    - "fresh" → best_before_date: "fresh"
-    - These are NOT lead_time
+        DATE FIELDS:
+        - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
+        - "BBD 03.06.2026" → best_before_date: "2026-06-03"
+        - "fresh" → best_before_date: "fresh"
+        - These are NOT lead_time
 
-    CUSTOM STATUS:
-    - "T1" → custom_status: "T1"
-    - "T2" → custom_status: "T2"
+        CUSTOM STATUS:
+        - "T1" → custom_status: "T1"
+        - "T2" → custom_status: "T2"
 
-    PACKAGING_RAW:
-    - "cans" → packaging_raw: "can"
-    - "btls" or "bottle" → packaging_raw: "bottle"
+        PACKAGING_RAW:
+        - "cans" → packaging_raw: "can"
+        - "btls" or "bottle" → packaging_raw: "bottle"
 
-    LABEL LANGUAGE:
-    - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
-    - "UK text" → label_language: "EN"
-    - "SA label" → label_language: "multiple" 
-    - "multi text" → label_language: "multiple"
-    - If not mentioned, return null.
+        LABEL LANGUAGE:
+        - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
+        - "UK text" → label_language: "EN"
+        - "SA label" → label_language: "multiple" 
+        - "multi text" → label_language: "multiple"
+        - If not mentioned, return null.
 
         COMMON PATTERNS IN EMAILS:
         - "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
@@ -190,10 +191,10 @@ async def extract_offer(text: str) -> dict:
 
             content = response.choices[0].message.content
             logger.info(f"OpenAI response received for chunk {idx + 1}, length: {len(content)}")
-            
+
             result = json.loads(content)
             products = result.get('products', [])
-            
+
             cleaned_products = []
             for product in products:
                 # Clean product nulls
@@ -209,7 +210,7 @@ async def extract_offer(text: str) -> dict:
                             product[key] = None
                         else:
                             product[key] = None
-                            
+
                 cleaned_product = clean_product_data(product)
                 cleaned_products.append(cleaned_product)
 
@@ -370,9 +371,9 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - Ensure you capture the full product name and brand.
                     - If a row is clearly a product offer, extract it.
                     - If a row is just a subtotal or header, skip it.
-                    - If a field is NOT FOUND or doesn't exist, use "Not Found" for strings and 0 for numbers.
-                    - NEVER return empty string "" for missing values, always use "Not Found".
-                    
+                    - If a field is NOT FOUND or doesn't exist, use null (NOT "Not Found" and NOT 0).
+                    - NEVER return empty string "" for missing values, always use null.
+
                     PRICE INTERPRETATION:
                     - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
                     - "11,40eur/btl" → price_per_unit: 11.40
@@ -386,8 +387,8 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
 
                     ALCOHOL PERCENT:
-                    - If input contains "40%" -> alcohol_percent: 40
-                    - If input contains "5%" -> alcohol_percent: 5
+                    - If input contains "40%" → alcohol_percent: 40
+                    - If input contains "5%" → alcohol_percent: 5
                     - If already numeric, keep it unchanged. NEVER multiply by 100.
                     - If missing, return null.
 
@@ -399,7 +400,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - If none found in those places, return null. DO NOT default to the email sender.
 
                     INCOTERM & LOCATION:
-                    - Example: "FCA Prague" -> incoterm: "FCA", location: "Prague"
+                    - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
                     - If no incoterm or location found, return null.
 
                     DATE FIELDS:
@@ -411,11 +412,11 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     CUSTOM STATUS:
                     - "T1" → custom_status: "T1"
                     - "T2" → custom_status: "T2"
-                    
+
                     PACKAGING_RAW:
                     - "cans" → packaging_raw: "can"
                     - "btls" or "bottle" → packaging_raw: "bottle"
-                    
+
                     LABEL LANGUAGE:
                     - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
                     - "UK text" → label_language: "EN"
@@ -672,7 +673,8 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema."},
+                                {"type": "text",
+                                 "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema."},
                                 {
                                     "type": "image_url",
                                     "image_url": f"data:{content_type};base64,{base64_image}",
@@ -777,7 +779,8 @@ def clean_product_data(product: dict) -> dict:
     for field, default_value in schema_fields.items():
         if field in product:
             value = product[field]
-            
+
+            # Convert "Not Found" and empty strings to None
             if value in [None, "Not Found", "", "null"]:
                 cleaned_product[field] = default_value if default_value is not None else None
             else:
@@ -786,38 +789,64 @@ def clean_product_data(product: dict) -> dict:
                     'quantity_case', 'price_per_unit', 'price_per_unit_eur',
                     'price_per_case', 'price_per_case_eur', 'alcohol_percent', 'moq_cases'
                 ]
-                
+
                 if field in numeric_keys:
                     try:
-                        cleaned_product[field] = float(value)
+                        if field == 'alcohol_percent' and isinstance(value, (int, float)):
+                            if value > 1 and value <= 100:
+                                # cleaned_product[field] = float(value)
+                                pass
+                            elif value <= 1 and value > 0:
+                                # cleaned_product[field] = float(value * 100)
+                                pass
+                            else:
+                                cleaned_product[field] = float(value)
+                        else:
+                            cleaned_product[field] = float(value)
                     except (ValueError, TypeError):
                         cleaned_product[field] = None
                 elif isinstance(default_value, list):
-                     cleaned_product[field] = value if isinstance(value, list) else []
+                    cleaned_product[field] = value if isinstance(value, list) else []
                 elif isinstance(default_value, bool):
-                     cleaned_product[field] = bool(value)
+                    cleaned_product[field] = bool(value)
                 else:
-                    cleaned_product[field] = str(value)
+                    cleaned_product[field] = str(value) if value is not None else None
         else:
             cleaned_product[field] = default_value
 
-    if cleaned_product['product_key'] in [None, 'Not Found'] and cleaned_product['product_name'] not in [None, 'Not Found']:
-        product_key = str(cleaned_product['product_name']).replace(' ', '_').replace('/', '_').replace('&', '_').replace('.', '').upper()
+    if cleaned_product['product_key'] in [None, 'Not Found'] and cleaned_product['product_name'] not in [None,
+                                                                                                         'Not Found']:
+        product_key = str(cleaned_product['product_name']).replace(' ', '_').replace('/', '_').replace('&',
+                                                                                                       '_').replace('.',
+                                                                                                                    '').upper()
         cleaned_product['product_key'] = product_key
 
     if (
-        cleaned_product['price_per_unit'] in [None, 0] and
-        cleaned_product['price_per_case'] is not None and cleaned_product['price_per_case'] > 0 and
-        cleaned_product['units_per_case'] is not None and cleaned_product['units_per_case'] > 0
+            cleaned_product['price_per_unit'] in [None, 0] and
+            cleaned_product['price_per_case'] is not None and cleaned_product['price_per_case'] > 0 and
+            cleaned_product['units_per_case'] is not None and cleaned_product['units_per_case'] > 0
     ):
         cleaned_product['price_per_unit'] = cleaned_product['price_per_case'] / cleaned_product['units_per_case']
         cleaned_product['price_per_unit_eur'] = cleaned_product['price_per_unit']
 
-    if cleaned_product['price_per_unit_eur'] in [None, 0] and cleaned_product['price_per_unit'] is not None and cleaned_product['price_per_unit'] > 0:
+    if cleaned_product['price_per_unit_eur'] in [None, 0] and cleaned_product['price_per_unit'] is not None and \
+            cleaned_product['price_per_unit'] > 0:
         cleaned_product['price_per_unit_eur'] = cleaned_product['price_per_unit']
 
-    if cleaned_product['price_per_case_eur'] in [None, 0] and cleaned_product['price_per_case'] is not None and cleaned_product['price_per_case'] > 0:
+    if cleaned_product['price_per_case_eur'] in [None, 0] and cleaned_product['price_per_case'] is not None and \
+            cleaned_product['price_per_case'] > 0:
         cleaned_product['price_per_case_eur'] = cleaned_product['price_per_case']
+
+    numeric_fields_never_zero = [
+        'cases_per_pallet', 'quantity_case', 'moq_cases',
+        'alcohol_percent', 'unit_volume_ml', 'units_per_case'
+    ]
+
+    for field in numeric_fields_never_zero:
+        if field in cleaned_product and cleaned_product[field] == 0:
+            original_value = product.get(field) if isinstance(product, dict) else None
+            if original_value not in [0, "0"]:
+                cleaned_product[field] = None
 
     return cleaned_product
 
