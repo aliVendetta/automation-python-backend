@@ -85,6 +85,12 @@ async def extract_offer(text: str) -> dict:
         logger.info(f"Processing chunk {idx + 1} of {len(text_chunks)}...")
 
         prompt = f"""
+        🔥 MASTER EXTRACTION POLICY - CRITICAL RULES TO FOLLOW:
+        The system must never fabricate, assume, or auto-fill missing information.
+        If a value is not explicitly present in the source file, leave the field blank.
+        When multiple incoterms or pricing structures are present, create separate rows.
+        All normalization rules (volume, percentage, currency, incoterm conversion) must follow strict formatting standards defined below.
+
         You are extracting commercial alcohol offers from text.
         Return JSON ONLY, no explanation.
 
@@ -110,7 +116,7 @@ async def extract_offer(text: str) -> dict:
         - bottle_or_can_type: Packaging type (bottle/can/other).
         - price_per_unit: Unit price.
         - price_per_case: Case price.
-        - currency: Currency (EUR, USD, GBP...). Extract this from the text - look for currency symbols (€, $, £) or currency codes.
+        - currency: Currency (EUR, USD, GBP...). Extract this from the text - look for currency symbols (€, $, £) or currency codes. If EURO is written, convert to EUR.
         - price_per_unit_eur: Unit price converted into EUR. (Leave as "Not Found" - will be calculated later)
         - price_per_case_eur: Case price converted into EUR. (Leave as "Not Found" - will be calculated later)
         - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
@@ -118,7 +124,7 @@ async def extract_offer(text: str) -> dict:
         - min_order_quantity_case: Minimum order quantity in cases.
         - port: Port of loading/destination if applicable.
         - lead_time: Lead time or availability.
-        - supplier_name: Name of the supplier (leave as "Not Found").
+        - supplier_name: Name of the supplier. Must be extracted from email signature, company footer, header, or official company name. NOT person names or sales desk names.
         - supplier_reference: Supplier offer reference.
         - supplier_country: Supplier's country.
         - offer_date: Date of the offer (leave as "Not Found").
@@ -134,29 +140,142 @@ async def extract_offer(text: str) -> dict:
         - label_language: Languages on label (e.g. 'UK text', 'SA label').
         - ean_code: EAN product barcode.
         - gift_box: Indicates if product includes gift box (GBX).
-        - refillable_status: REF/NRF: refillable or non‑refillable.
-        - custom_status: Customs status: T1 or T2.
+        - refillable_status: REF/NRF: refillable or non‑refillable. Only extract if explicitly written. Never assume NRF by default.
+        - custom_status: Customs status: T1 or T2. Extract if present in offer.
         - moq_cases: Minimum order quantity stated in the offer.
 
-        CRITICAL RULES FOR MISSING VALUES:
-        1. If a field is NOT explicitly stated in the text, return "Not Found". Do NOT invent or hallucinate values.
-        2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
-        3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
-        4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
-        5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
-        6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
-        7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
-        8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
-        9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
-        10. Never hallucinate quantities. If you're unsure, use "Not Found".
+        🚨 1️⃣ EMPTY VALUES RULE (VERY IMPORTANT):
+        If a value is NOT explicitly present in the original offer, the system MUST:
+        - Leave the field EMPTY
+        - NEVER insert: 0, "Not Found", "NRF", default placeholders
+        - Blank means blank.
+
+        🚨 2️⃣ RF / NRF RULE:
+        Column: refillable_status
+        - Only extract RF or NRF if explicitly written in the original offer
+        - If RF/NRF is NOT present → leave blank
+        - Never assume NRF by default
+
+        🚨 3️⃣ CATEGORY & SUB-CATEGORY LOGIC:
+        If category = Spirits:
+        System must intelligently classify sub-category based on brand/product name:
+        Examples:
+        - Martell → Cognac
+        - Hennessy → Cognac
+        - Bacardi → Rum
+        - Absolut → Vodka
+        - Jack Daniel's → Whiskey
+        - Jameson → Irish Whiskey
+        - Captain Morgan → Rum
+        If sub-category cannot be confidently determined → leave blank
+        Do NOT use "Not Found".
+
+        🚨 4️⃣ ALCOHOL PERCENT FORMAT RULE:
+        Column: alcohol_percent
+        Rules:
+        - Must always be formatted as percentage string
+        Example:
+        - 37.5% (correct)
+        - NOT 0.375
+        - NOT 37.5
+        - If not present → leave blank
+        - Never default to 0
+
+        🚨 5️⃣ INCOTERM EXTRACTION RULE:
+        If multiple incoterms exist (e.g., "EXW Riga / DAP Loendersloot"):
+        System must:
+        - Split into separate rows
+        - Duplicate all product data
+        - Only change incoterm + location
+        If incoterm appears in sentence like "EX Warehouse Dublin":
+        - Convert to standardized format: EXW Dublin
+
+        🚨 6️⃣ SUPPLIER NAME EXTRACTION RULE:
+        Supplier name must be extracted from:
+        - Email signature
+        - Company footer
+        - Header
+        - Official company name
+        NOT:
+        - The sender person name
+        - Sales desk name
+        - Email username
+        Person names must not be used as supplier_name.
+
+        🚨 7️⃣ CUSTOM STATUS RULE (T1 / T2):
+        Column: custom_status
+        If offer contains:
+        - T1
+        - T2
+        Extract it.
+        If not present → leave blank.
+
+        🚨 8️⃣ PRICE RULES:
+        - If price per case is not provided: Leave blank
+        - Do NOT calculate automatically unless clearly instructed
+        - If currency is written as: EURO → convert to EUR
+        - If EUR price already provided: price_per_unit_eur = price_per_unit (if same currency)
+
+        🚨 9️⃣ UNIT VOLUME EXTRACTION RULE:
+        Examples:
+        - 0.5L → 500 ml
+        - 70cl → 700 ml
+        - 0.375L → 375 ml
+        Always normalize to: unit_volume_ml
+        Never use: 0.38 or rounded incorrect values
+
+        🚨 🔟 MULTI-PRICE OFFERS RULE:
+        If offer contains multiple products with different prices:
+        System must create:
+        - Separate row per product
+        - No merging
+
+        🚨 1️⃣1️⃣ LEAD TIME RULE:
+        Extract natural language:
+        Example: "approximately 3 weeks"
+        Store exactly as written.
+        Do not rewrite.
+
+        🚨 1️⃣2️⃣ MOQ RULE:
+        If MOQ not explicitly mentioned:
+        - Leave blank
+        - Do NOT assume 0.
+
+        🚨 1️⃣3️⃣ CONFIDENCE SCORE RULE:
+        Confidence should decrease when:
+        - Sub-category inferred
+        - Incoterm converted
+        - Volume converted
+        - Supplier inferred from signature
+        High confidence only when directly written.
+
+        🚨 1️⃣4️⃣ ERROR FLAGS:
+        If:
+        - Multiple incoterms detected
+        - Missing currency
+        - Volume ambiguous
+        - Supplier unclear
+        Add clear internal flag in error_flags
+
+        🚨 1️⃣5️⃣ SOURCE DATA RULE:
+        Always preserve:
+        - source_channel
+        - source_filename
+        - source_message_id
+        Never modify.
+
+        🚨 1️⃣6️⃣ STRICT EXTRACTION PRINCIPLE:
+        AI must follow:
+        "Extract only what is explicitly written or confidently inferred by well-defined classification logic.
+        Never assume missing data."
 
         IMPORTANT RULES:
         1. Extract ALL products mentioned in the text. Return one object per product in the 'products' array.
         2. CAPTURE FULL NAMES: 'Baileys Original' is the product_name, not just 'Original'.
         3. If you find multiple quantities/prices for one product, create separate entries if they look like distinct offers.
-        4. If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
-        5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
-        6. DO NOT use null for any field - always use "Not Found" for missing values.
+        4. If a field is NOT FOUND or doesn't exist, leave it blank (NOT null and NOT 0).
+        5. DO NOT leave string fields as empty string "" - if missing, leave blank.
+        6. DO NOT use null for any field - always leave blank for missing values.
         7. Use AI to intelligently match values to fields - if something in email matches a field, extract it
 
         PRICE INTERPRETATION:
@@ -171,49 +290,49 @@ async def extract_offer(text: str) -> dict:
         - "960 cs" → quantity_case: 960
         - "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
         - "1932cs" → quantity_case: 1932
-        - If quantity not specified, return "Not Found". Do NOT default to 0.
+        - If quantity not specified, leave blank. Do NOT default to 0.
         - IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
         - quantity_case is the total number of cases offered, not the packaging configuration.
         - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
 
         ALCOHOL PERCENT - CRITICAL INSTRUCTION:
         - Extract the alcohol percentage exactly as it appears in the source text.
-        - If the text shows "40%" → output alcohol_percent: 40
-        - If the text shows "5%" → output alcohol_percent: 5  
-        - If the text shows "17%" → output alcohol_percent: 17
-        - If the text shows "40" (without % sign) → output alcohol_percent: 40
-        - If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
-        - If the text shows "40.0" → output alcohol_percent: 40.0
+        - If the text shows "40%" → output alcohol_percent: "40%"
+        - If the text shows "5%" → output alcohol_percent: "5%"  
+        - If the text shows "17%" → output alcohol_percent: "17%"
+        - If the text shows "40" (without % sign) → output alcohol_percent: "40%" (add % sign)
+        - If the text shows "0.4" or "0,4" → output alcohol_percent: "0.4%" (DO NOT multiply by 100)
+        - If the text shows "40.0" → output alcohol_percent: "40.0%"
         - NEVER perform any mathematical conversion or multiplication on the alcohol value.
-        - NEVER change 0.4 to 40 - keep it exactly as 0.4.
-        - If alcohol percentage is not found in the text, return "Not Found".
+        - NEVER change 0.4 to 40 - keep it exactly as 0.4 with % sign.
+        - If alcohol percentage is not found in the text, leave blank.
         - Do NOT default to 0 when alcohol percentage is missing.
 
         CASES_PER_PALLET - CRITICAL RULE:
         - Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
         - Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
         - If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
-        - If not explicitly stated, cases_per_pallet must be "Not Found".
-        - If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
+        - If not explicitly stated, cases_per_pallet must be blank.
+        - If cases_per_pallet = 0, that means missing - treat as blank.
 
         QUANTITY_CASE - CRITICAL RULE:
         - Only populate quantity_case if the total number of cases is EXPLICITLY stated.
         - Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
         - Do NOT derive quantity_case from packaging information like "12x750ml".
         - "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
-        - If quantity_case is not explicitly stated, it must be "Not Found".
-        - If quantity_case = 0, that means "Not Found" - treat as "Not Found".
+        - If quantity_case is not explicitly stated, it must be blank.
+        - If quantity_case = 0, that means missing - treat as blank.
 
         SUPPLIER NAME EXTRACTION:
         - Attempt to extract in this exact priority:
           1. Extract from file content itself.
           2. Extract from email body (e.g., "Offer from MILANAKO company").
           3. Extract from forwarded email signature block.
-        - If none found in those places, return "Not Found". DO NOT default to the email sender.
+        - If none found in those places, leave blank. DO NOT default to the email sender.
 
         INCOTERM & LOCATION:
         - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
-        - If no incoterm or location found, return "Not Found".
+        - If no incoterm or location found, leave blank.
 
         DATE FIELDS:
         - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
@@ -234,7 +353,7 @@ async def extract_offer(text: str) -> dict:
         - "UK text" → label_language: "EN"
         - "SA label" → label_language: "multiple" 
         - "multi text" → label_language: "multiple"
-        - If not mentioned, return "Not Found".
+        - If not mentioned, leave blank.
 
         COMMON PATTERNS IN EMAILS:
         - "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
@@ -268,12 +387,13 @@ async def extract_offer(text: str) -> dict:
         - Food → category: "Food"
 
         REMEMBER: 
-        - When in doubt, use "Not Found". 
+        - When in doubt, leave blank. 
         - Never invent numbers. 
         - Only extract what is explicitly stated. 
-        - If a value is 0, that means "Not Found" - treat as "Not Found".
-        - Use "Not Found" for ALL missing fields - both strings AND numbers.
+        - If a value is 0, that means missing - treat as blank.
+        - Leave ALL missing fields blank - both strings AND numbers.
         - IMPORTANT: Extract the currency from price notations (€, $, £, EUR, USD, GBP, etc.)
+        - If "EURO" is written, convert to "EUR"
 
         Text Chunk ({idx + 1}/{len(text_chunks)}):
         {chunk}
@@ -307,9 +427,9 @@ async def extract_offer(text: str) -> dict:
                             'alcohol_percent', 'moq_cases'
                         ]
                         if key in numeric_fields:
-                            product[key] = "Not Found"
+                            product[key] = None
                         else:
-                            product[key] = "Not Found"
+                            product[key] = ""
 
                 cleaned_product = clean_product_data(product)
                 cleaned_products.append(cleaned_product)
@@ -328,10 +448,10 @@ async def extract_offer(text: str) -> dict:
     # After extracting all products, convert prices to EUR
     logger.info("Converting prices to EUR for all products...")
     for product in all_products:
-        currency = product.get('currency', "Not Found")
+        currency = product.get('currency', "")
 
         # Skip if currency is not found or already EUR
-        if currency in ["Not Found", "", None, "EUR"]:
+        if currency in ["", None, "EUR"]:
             product['price_per_unit_eur'] = product.get('price_per_unit')
             product['price_per_case_eur'] = product.get('price_per_case')
             continue
@@ -340,7 +460,7 @@ async def extract_offer(text: str) -> dict:
         exchange_rate = await get_exchange_rate_to_eur(currency)
 
         # Convert unit price if exists
-        if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+        if product.get('price_per_unit') not in [None, "", 0, "0"]:
             product['price_per_unit_eur'] = convert_price_to_eur(
                 product['price_per_unit'],
                 currency,
@@ -348,7 +468,7 @@ async def extract_offer(text: str) -> dict:
             )
 
         # Convert case price if exists
-        if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+        if product.get('price_per_case') not in [None, "", 0, "0"]:
             product['price_per_case_eur'] = convert_price_to_eur(
                 product['price_per_case'],
                 currency,
@@ -447,6 +567,12 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                         data_rows.append(row_dict)
 
                     batch_text = f"""
+                    🔥 MASTER EXTRACTION POLICY - CRITICAL RULES TO FOLLOW:
+                    The system must never fabricate, assume, or auto-fill missing information.
+                    If a value is not explicitly present in the source file, leave the field blank.
+                    When multiple incoterms or pricing structures are present, create separate rows.
+                    All normalization rules (volume, percentage, currency, incoterm conversion) must follow strict formatting standards defined below.
+
                     EXCEL DATA BATCH ({batch_start + 1}-{batch_end} of {total_rows}):
 
                     Extract EXACTLY {len(batch_df)} products from this data:
@@ -501,25 +627,138 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - custom_status: Customs status: T1 or T2
                     - moq_cases: Minimum order quantity stated in the offer.
 
-                    CRITICAL RULES FOR MISSING VALUES:
-                    1. If a field is NOT explicitly stated in the data, return "Not Found". Do NOT invent or hallucinate values.
-                    2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
-                    3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
-                    4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
-                    5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
-                    6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
-                    7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
-                    8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
-                    9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
-                    10. Never hallucinate quantities. If you're unsure, use "Not Found".
+                    🚨 1️⃣ EMPTY VALUES RULE (VERY IMPORTANT):
+                    If a value is NOT explicitly present in the original offer, the system MUST:
+                    - Leave the field EMPTY
+                    - NEVER insert: 0, "Not Found", "NRF", default placeholders
+                    - Blank means blank.
+
+                    🚨 2️⃣ RF / NRF RULE:
+                    Column: refillable_status
+                    - Only extract RF or NRF if explicitly written in the original offer
+                    - If RF/NRF is NOT present → leave blank
+                    - Never assume NRF by default
+
+                    🚨 3️⃣ CATEGORY & SUB-CATEGORY LOGIC:
+                    If category = Spirits:
+                    System must intelligently classify sub-category based on brand/product name:
+                    Examples:
+                    - Martell → Cognac
+                    - Hennessy → Cognac
+                    - Bacardi → Rum
+                    - Absolut → Vodka
+                    - Jack Daniel's → Whiskey
+                    - Jameson → Irish Whiskey
+                    - Captain Morgan → Rum
+                    If sub-category cannot be confidently determined → leave blank
+                    Do NOT use "Not Found".
+
+                    🚨 4️⃣ ALCOHOL PERCENT FORMAT RULE:
+                    Column: alcohol_percent
+                    Rules:
+                    - Must always be formatted as percentage string
+                    Example:
+                    - 37.5% (correct)
+                    - NOT 0.375
+                    - NOT 37.5
+                    - If not present → leave blank
+                    - Never default to 0
+
+                    🚨 5️⃣ INCOTERM EXTRACTION RULE:
+                    If multiple incoterms exist (e.g., "EXW Riga / DAP Loendersloot"):
+                    System must:
+                    - Split into separate rows
+                    - Duplicate all product data
+                    - Only change incoterm + location
+                    If incoterm appears in sentence like "EX Warehouse Dublin":
+                    - Convert to standardized format: EXW Dublin
+
+                    🚨 6️⃣ SUPPLIER NAME EXTRACTION RULE:
+                    Supplier name must be extracted from:
+                    - Email signature
+                    - Company footer
+                    - Header
+                    - Official company name
+                    NOT:
+                    - The sender person name
+                    - Sales desk name
+                    - Email username
+                    Person names must not be used as supplier_name.
+
+                    🚨 7️⃣ CUSTOM STATUS RULE (T1 / T2):
+                    Column: custom_status
+                    If offer contains:
+                    - T1
+                    - T2
+                    Extract it.
+                    If not present → leave blank.
+
+                    🚨 8️⃣ PRICE RULES:
+                    - If price per case is not provided: Leave blank
+                    - Do NOT calculate automatically unless clearly instructed
+                    - If currency is written as: EURO → convert to EUR
+                    - If EUR price already provided: price_per_unit_eur = price_per_unit (if same currency)
+
+                    🚨 9️⃣ UNIT VOLUME EXTRACTION RULE:
+                    Examples:
+                    - 0.5L → 500 ml
+                    - 70cl → 700 ml
+                    - 0.375L → 375 ml
+                    Always normalize to: unit_volume_ml
+                    Never use: 0.38 or rounded incorrect values
+
+                    🚨 🔟 MULTI-PRICE OFFERS RULE:
+                    If offer contains multiple products with different prices:
+                    System must create:
+                    - Separate row per product
+                    - No merging
+
+                    🚨 1️⃣1️⃣ LEAD TIME RULE:
+                    Extract natural language:
+                    Example: "approximately 3 weeks"
+                    Store exactly as written.
+                    Do not rewrite.
+
+                    🚨 1️⃣2️⃣ MOQ RULE:
+                    If MOQ not explicitly mentioned:
+                    - Leave blank
+                    - Do NOT assume 0.
+
+                    🚨 1️⃣3️⃣ CONFIDENCE SCORE RULE:
+                    Confidence should decrease when:
+                    - Sub-category inferred
+                    - Incoterm converted
+                    - Volume converted
+                    - Supplier inferred from signature
+                    High confidence only when directly written.
+
+                    🚨 1️⃣4️⃣ ERROR FLAGS:
+                    If:
+                    - Multiple incoterms detected
+                    - Missing currency
+                    - Volume ambiguous
+                    - Supplier unclear
+                    Add clear internal flag in error_flags
+
+                    🚨 1️⃣5️⃣ SOURCE DATA RULE:
+                    Always preserve:
+                    - source_channel
+                    - source_filename
+                    - source_message_id
+                    Never modify.
+
+                    🚨 1️⃣6️⃣ STRICT EXTRACTION PRINCIPLE:
+                    AI must follow:
+                    "Extract only what is explicitly written or confidently inferred by well-defined classification logic.
+                    Never assume missing data."
 
                     MAPPING FROM EXCEL DATA:
                     - Ensure you capture the full product name and brand.
                     - If a row is clearly a product offer, extract it.
                     - If a row is just a subtotal or header, skip it.
-                    - If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
-                    - NEVER return empty string "" for missing values, always use "Not Found".
-                    - DO NOT use null for any field - always use "Not Found" for missing values.
+                    - If a field is NOT FOUND or doesn't exist, leave it blank (NOT null and NOT 0).
+                    - NEVER return empty string "" for missing values, always leave blank.
+                    - DO NOT use null for any field - always leave blank for missing values.
 
                     PRICE INTERPRETATION:
                     - "15.95eur" → price_per_case: 15.95, currency: "EUR" (when no /btl or /cs suffix, assume per case)
@@ -532,49 +771,49 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - "960 cs" → quantity_case: 960
                     - "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
                     - "1932cs" → quantity_case: 1932
-                    - If quantity not specified, return "Not Found". Do NOT default to 0.
+                    - If quantity not specified, leave blank. Do NOT default to 0.
                     - IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
                     - quantity_case is the total number of cases offered, not the packaging configuration.
                     - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
 
                     ALCOHOL PERCENT - CRITICAL INSTRUCTION:
                     - Extract the alcohol percentage exactly as it appears in the source text.
-                    - If the text shows "40%" → output alcohol_percent: 40
-                    - If the text shows "5%" → output alcohol_percent: 5
-                    - If the text shows "17%" → output alcohol_percent: 17
-                    - If the text shows "40" (without % sign) → output alcohol_percent: 40
-                    - If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
-                    - If the text shows "40.0" → output alcohol_percent: 40.0
+                    - If the text shows "40%" → output alcohol_percent: "40%"
+                    - If the text shows "5%" → output alcohol_percent: "5%"
+                    - If the text shows "17%" → output alcohol_percent: "17%"
+                    - If the text shows "40" (without % sign) → output alcohol_percent: "40%" (add % sign)
+                    - If the text shows "0.4" or "0,4" → output alcohol_percent: "0.4%" (DO NOT multiply by 100)
+                    - If the text shows "40.0" → output alcohol_percent: "40.0%"
                     - NEVER perform any mathematical conversion or multiplication on the alcohol value.
-                    - NEVER change 0.4 to 40 - keep it exactly as 0.4.
-                    - If alcohol percentage is not found in the text, return "Not Found".
+                    - NEVER change 0.4 to 40 - keep it exactly as 0.4 with % sign.
+                    - If alcohol percentage is not found in the text, leave blank.
                     - Do NOT default to 0 when alcohol percentage is missing.
 
                     CASES_PER_PALLET - CRITICAL RULE:
                     - Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
                     - Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
                     - If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
-                    - If not explicitly stated, cases_per_pallet must be "Not Found".
-                    - If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
+                    - If not explicitly stated, cases_per_pallet must be blank.
+                    - If cases_per_pallet = 0, that means missing - treat as blank.
 
                     QUANTITY_CASE - CRITICAL RULE:
                     - Only populate quantity_case if the total number of cases is EXPLICITLY stated.
                     - Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
                     - Do NOT derive quantity_case from packaging information like "12x750ml".
                     - "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
-                    - If quantity_case is not explicitly stated, it must be "Not Found".
-                    - If quantity_case = 0, that means "Not Found" - treat as "Not Found".
+                    - If quantity_case is not explicitly stated, it must be blank.
+                    - If quantity_case = 0, that means missing - treat as blank.
 
                     SUPPLIER NAME EXTRACTION:
                     - Attempt to extract in this exact priority:
                       1. Extract from file content itself.
                       2. Extract from email body (e.g., "Offer from MILANAKO company").
                       3. Extract from forwarded email signature block.
-                    - If none found in those places, return "Not Found". DO NOT default to the email sender.
+                    - If none found in those places, leave blank. DO NOT default to the email sender.
 
                     INCOTERM & LOCATION:
                     - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
-                    - If no incoterm or location found, return "Not Found".
+                    - If no incoterm or location found, leave blank.
 
                     DATE FIELDS:
                     - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
@@ -595,15 +834,16 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - "UK text" → label_language: "EN"
                     - "SA label" → label_language: "multiple" 
                     - "multi text" → label_language: "multiple"
-                    - If not mentioned, return "Not Found".
+                    - If not mentioned, leave blank.
 
                     REMEMBER: 
-                    - When in doubt, use "Not Found". 
+                    - When in doubt, leave blank. 
                     - Never invent numbers. 
                     - Only extract what is explicitly stated. 
-                    - If a value is 0, that means "Not Found" - treat as "Not Found".
-                    - Use "Not Found" for ALL missing fields - both strings AND numbers.
+                    - If a value is 0, that means missing - treat as blank.
+                    - Leave ALL missing fields blank - both strings AND numbers.
                     - IMPORTANT: Extract currency from price columns where present.
+                    - If "EURO" is written, convert to "EUR"
 
                     RETURN FORMAT:
                     {{
@@ -789,10 +1029,10 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     # Convert prices to EUR for all extracted products
                     logger.info("Converting prices to EUR for all Excel products...")
                     for product in all_extracted_products:
-                        currency = product.get('currency', "Not Found")
+                        currency = product.get('currency', "")
 
                         # Skip if currency is not found or already EUR
-                        if currency in ["Not Found", "", None, "EUR"]:
+                        if currency in ["", None, "EUR"]:
                             product['price_per_unit_eur'] = product.get('price_per_unit')
                             product['price_per_case_eur'] = product.get('price_per_case')
                             continue
@@ -800,7 +1040,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                         exchange_rate = await get_exchange_rate_to_eur(currency)
 
                         # Convert unit price if exists
-                        if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+                        if product.get('price_per_unit') not in [None, "", 0, "0"]:
                             product['price_per_unit_eur'] = convert_price_to_eur(
                                 product['price_per_unit'],
                                 currency,
@@ -808,7 +1048,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                             )
 
                         # Convert case price if exists
-                        if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+                        if product.get('price_per_case') not in [None, "", 0, "0"]:
                             product['price_per_case_eur'] = convert_price_to_eur(
                                 product['price_per_case'],
                                 currency,
@@ -832,15 +1072,15 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
 
                     if isinstance(fallback_result, dict) and 'products' in fallback_result:
                         for product in fallback_result['products']:
-                            if product.get('currency') not in ["Not Found", "", None, "EUR"]:
+                            if product.get('currency') not in ["", None, "EUR"]:
                                 exchange_rate = await get_exchange_rate_to_eur(product.get('currency'))
-                                if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+                                if product.get('price_per_unit') not in [None, "", 0, "0"]:
                                     product['price_per_unit_eur'] = convert_price_to_eur(
                                         product['price_per_unit'],
                                         product.get('currency'),
                                         exchange_rate
                                     )
-                                if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+                                if product.get('price_per_case') not in [None, "", 0, "0"]:
                                     product['price_per_case_eur'] = convert_price_to_eur(
                                         product['price_per_case'],
                                         product.get('currency'),
@@ -917,15 +1157,15 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
 
                 if isinstance(result, dict) and 'products' in result:
                     for product in result['products']:
-                        if product.get('currency') not in ["Not Found", "", None, "EUR"]:
+                        if product.get('currency') not in ["", None, "EUR"]:
                             exchange_rate = await get_exchange_rate_to_eur(product.get('currency'))
-                            if product.get('price_per_unit') not in [None, "Not Found", "", 0, "0"]:
+                            if product.get('price_per_unit') not in [None, "", 0, "0"]:
                                 product['price_per_unit_eur'] = convert_price_to_eur(
                                     product['price_per_unit'],
                                     product.get('currency'),
                                     exchange_rate
                                 )
-                            if product.get('price_per_case') not in [None, "Not Found", "", 0, "0"]:
+                            if product.get('price_per_case') not in [None, "", 0, "0"]:
                                 product['price_per_case_eur'] = convert_price_to_eur(
                                     product['price_per_case'],
                                     product.get('currency'),
@@ -973,52 +1213,52 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
 def clean_product_data(product: dict) -> dict:
     """Clean up product data to ensure it matches schema exactly"""
     schema_fields = {
-        'uid': "Not Found",
-        'product_key': "Not Found",
-        'processing_version': "Not Found",
-        'brand': "Not Found",
-        'product_name': "Not Found",
-        'product_reference': "Not Found",
-        'category': "Not Found",
-        'sub_category': "Not Found",
-        'origin_country': "Not Found",
-        'vintage': "Not Found",
-        'alcohol_percent': None,  # Changed from "Not Found" to None for numeric fields
-        'packaging': "Not Found",
-        'unit_volume_ml': None,  # Changed from "Not Found" to None for numeric fields
-        'units_per_case': None,  # Changed from "Not Found" to None for numeric fields
-        'cases_per_pallet': None,  # Changed from "Not Found" to None for numeric fields
-        'quantity_case': None,  # Changed from "Not Found" to None for numeric fields
-        'bottle_or_can_type': "Not Found",
-        'price_per_unit': None,  # Changed from "Not Found" to None for numeric fields
-        'price_per_case': None,  # Changed from "Not Found" to None for numeric fields
+        'uid': "",
+        'product_key': "",
+        'processing_version': "",
+        'brand': "",
+        'product_name': "",
+        'product_reference': "",
+        'category': "",
+        'sub_category': "",
+        'origin_country': "",
+        'vintage': "",
+        'alcohol_percent': None,  # None for numeric fields
+        'packaging': "",
+        'unit_volume_ml': None,  # None for numeric fields
+        'units_per_case': None,  # None for numeric fields
+        'cases_per_pallet': None,  # None for numeric fields
+        'quantity_case': None,  # None for numeric fields
+        'bottle_or_can_type': "",
+        'price_per_unit': None,  # None for numeric fields
+        'price_per_case': None,  # None for numeric fields
         'currency': "EUR",
-        'price_per_unit_eur': None,  # Changed from "Not Found" to None for numeric fields
-        'price_per_case_eur': None,  # Changed from "Not Found" to None for numeric fields
-        'incoterm': "Not Found",
-        'location': "Not Found",
-        'min_order_quantity_case': None,  # Changed from "Not Found" to None for numeric fields
-        'port': "Not Found",
-        'lead_time': "Not Found",
-        'supplier_name': "Not Found",
-        'supplier_reference': "Not Found",
-        'supplier_country': "Not Found",
-        'offer_date': "Not Found",
-        'valid_until': "Not Found",
-        'date_received': "Not Found",
-        'source_channel': "Not Found",
-        'source_filename': "Not Found",
-        'source_message_id': "Not Found",
+        'price_per_unit_eur': None,  # None for numeric fields
+        'price_per_case_eur': None,  # None for numeric fields
+        'incoterm': "",
+        'location': "",
+        'min_order_quantity_case': None,  # None for numeric fields
+        'port': "",
+        'lead_time': "",
+        'supplier_name': "",
+        'supplier_reference': "",
+        'supplier_country': "",
+        'offer_date': "",
+        'valid_until': "",
+        'date_received': "",
+        'source_channel': "",
+        'source_filename': "",
+        'source_message_id': "",
         'confidence_score': 0.0,
         'error_flags': [],
         'needs_manual_review': False,
-        'best_before_date': "Not Found",
-        'label_language': "Not Found",
-        'ean_code': "Not Found",
-        'gift_box': "Not Found",
-        'refillable_status': "NRF",
-        'custom_status': "Not Found",
-        'moq_cases': None  # Changed from "Not Found" to None for numeric fields
+        'best_before_date': "",
+        'label_language': "",
+        'ean_code': "",
+        'gift_box': "",
+        'refillable_status': "",
+        'custom_status': "",
+        'moq_cases': None
     }
 
     cleaned_product = {}
@@ -1027,8 +1267,7 @@ def clean_product_data(product: dict) -> dict:
         if field in product:
             value = product[field]
 
-            # Convert None, empty strings, null, and 0 to appropriate default
-            if value in [None, "Not Found", "", "null", 0, "0"]:
+            if value in [None, "", "null", 0, "0"]:
                 cleaned_product[field] = default_value
             else:
                 numeric_keys = [
@@ -1039,9 +1278,12 @@ def clean_product_data(product: dict) -> dict:
 
                 if field in numeric_keys:
                     try:
-                        # For alcohol_percent, preserve the exact value without any conversion
                         if field == 'alcohol_percent':
-                            cleaned_product[field] = float(value)
+                            if isinstance(value, str) and '%' in value:
+                                cleaned_product[field] = value
+                            else:
+                                float_val = float(value)
+                                cleaned_product[field] = f"{float_val}%"
                         else:
                             cleaned_product[field] = float(value)
                     except (ValueError, TypeError):
@@ -1055,7 +1297,7 @@ def clean_product_data(product: dict) -> dict:
         else:
             cleaned_product[field] = default_value
 
-    if cleaned_product['product_key'] in ["Not Found"] and cleaned_product['product_name'] not in ["Not Found"]:
+    if cleaned_product['product_key'] in ["", None] and cleaned_product['product_name'] not in ["", None]:
         product_key = str(cleaned_product['product_name']).replace(' ', '_').replace('/', '_').replace('&',
                                                                                                        '_').replace('.',
                                                                                                                     '').upper()
