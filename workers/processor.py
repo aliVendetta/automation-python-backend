@@ -377,7 +377,11 @@ async def process_offer(payload, job_id: str):
                     price_per_case_eur=safe_data['price_per_case_eur'],
                     fx_rate=safe_data['fx_rate'],
                     fx_date=safe_data['fx_date'],
-                    alcohol_percent=safe_data['alcohol_percent'],
+                    alcohol_percent=(
+                        f"{safe_data['alcohol_percent']}%"
+                        if safe_data.get('alcohol_percent')
+                        else ""
+                    ),
                     origin_country=safe_data['origin_country'],
                     supplier_country=safe_data['supplier_country'],
                     incoterm=safe_data['incoterm'],
