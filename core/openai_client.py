@@ -376,6 +376,7 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - vintage: Vintage year (for wine/champagne).
                     - alcohol_percent: Alcohol percentage if applicable.
                     - packaging: Full packaging description (e.g. 6x750ml).
+                    - packaging_raw: Packaging type in raw form: "bottle" or "can". Default to "bottle" if not specified.
                     - unit_volume_ml: Volume per unit in milliliters (convert CL).
                     - units_per_case: Number of units per case.
                     - cases_per_pallet: Number of cases per pallet.
@@ -826,6 +827,7 @@ def clean_product_data(product: dict) -> dict:
         'vintage': "Not Found",
         'alcohol_percent': None,  # Changed from "Not Found" to None for numeric fields
         'packaging': "Not Found",
+        'packaging_raw': "bottle",
         'unit_volume_ml': None,  # Changed from "Not Found" to None for numeric fields
         'units_per_case': None,  # Changed from "Not Found" to None for numeric fields
         'cases_per_pallet': None,  # Changed from "Not Found" to None for numeric fields
