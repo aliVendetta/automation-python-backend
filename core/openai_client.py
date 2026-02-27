@@ -7,8 +7,6 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import logging
 import traceback
-import re
-from datetime import datetime
 
 # Root logging configured in entry points
 logger = logging.getLogger(__name__)
@@ -18,698 +16,269 @@ load_dotenv()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-async def get_exchange_rate_to_eur(currency: str) -> float:
-    """Get exchange rate from any currency to EUR using OpenAI"""
-    if currency in ["Not Found", "", None, "EUR"]:
-        return 1.0
-
-    try:
-        logger.info(f"Getting exchange rate for {currency} to EUR")
-
-        prompt = f"""
-        What is the current exchange rate from {currency} to EUR (Euro)?
-        Return ONLY a JSON object with the exchange rate as a float number.
-        Example: {{"rate": 0.85}} for USD to EUR
-        Use the most recent reliable exchange rate.
-        """
-
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=100
-        )
-
-        content = response.choices[0].message.content
-        result = json.loads(content)
-        rate = float(result.get('rate', 1.0))
-
-        logger.info(f"Exchange rate for {currency} to EUR: {rate}")
-        return rate
-
-    except Exception as e:
-        logger.error(f"Error getting exchange rate for {currency}: {e}")
-        return 1.0
-
-
-def convert_price_to_eur(price, currency, exchange_rate):
-    """Convert price to EUR using exchange rate"""
-    if price in [None, "Not Found", "", 0, "0"]:
-        return None
-    try:
-        price_float = float(price)
-        if price_float == 0:
-            return None
-        return round(price_float * exchange_rate, 2)
-    except (ValueError, TypeError):
-        return None
-
-
-# =============================================================================
-# MASTER SYSTEM PROMPT
-# All business rules consolidated here. Injected as the system role into every
-# OpenAI API call so rules apply consistently across Excel, PDF, image, and
-# free-text sources. The AI must output correct JSON — no backend correction.
-# =============================================================================
-MASTER_SYSTEM_PROMPT = """You are a professional commercial alcohol offer data extraction engine.
-Your sole job is to read source data (Excel rows, PDF text, email text, or image content)
-and return a perfectly structured JSON object {"products": [...]}.
-
-You MUST follow every rule below without exception. These rules override any assumption
-or default behaviour you might otherwise apply.
-
-════════════════════════════════════════════════════════════════════
-SECTION A — UNIVERSAL EXTRACTION RULES (apply to ALL source types)
-════════════════════════════════════════════════════════════════════
-
-──────────────────────────────────────────────────────────────────
-A1. BLANK FIELD RULE — HIGHEST PRIORITY
-──────────────────────────────────────────────────────────────────
-If a value is NOT explicitly present in the source, you MUST leave the field blank.
-  • String fields  → "" (empty string)
-  • Numeric fields → null
-NEVER output: 0, "Not Found", "N/A", "Unknown", "null" (as string), or any placeholder.
-"Blank means blank" — no exceptions.
-
-──────────────────────────────────────────────────────────────────
-A2. alcohol_percent — EXTRACTION, DETECTION & FORMAT  ⚠️ MANDATORY ⚠️
-──────────────────────────────────────────────────────────────────
-This field is HIGH PRIORITY. Actively search every column and every piece of text
-for the alcohol percentage before leaving it blank.
-
-COLUMN NAMES that contain alcohol data — check ALL of them:
-  "ABV", "Abv", "abv", "Alc%", "Alc %", "ALC", "Alcohol", "Alcohol %",
-  "Vol%", "Vol %", "VOL", "Volume %", "Strength", "Strength%", "Degree",
-  "Degrees", "Proof" (divide Proof value by 2 to get %)
-
-⚠️ DECIMAL FRACTION DETECTION — CRITICAL FOR EXCEL FILES:
-Many Excel files store ABV as a decimal fraction, NOT as a percentage integer.
-You MUST detect and convert correctly:
-
-  RULE: If the ABV/alcohol column value is LESS THAN 1.0 → it is a decimal fraction.
-        Multiply by 100 to get the real percentage.
-
-  Examples (decimal fraction → output):
-    0.40  → "40%"     (standard Whisky, Gin, Vodka)
-    0.375 → "37.5%"   (Bacardi, Smirnoff)
-    0.17  → "17%"     (Baileys, Kahlua)
-    0.46  → "46%"     (Teeling, aged Bushmills)
-    0.463 → "46.3%"   (Dingle Single Malt)
-    0.414 → "41.4%"   (Hendricks Gin)
-    0.425 → "42.5%"   (Dingle Gin)
-    0.04  → "4%"      (light beer)
-    0.034 → "3.4%"    (Carlsberg)
-    0.055 → "5.5%"    (Zyweic)
-    0.3   → "30%"     (Aftershock)
-    0.15  → "15%"     (Martini Bianco/Rosso/Extra Dry)
-    0.31  → "31%"     (Licor 43)
-    0.33  → "33%"     (Fireball)
-    0.35  → "35%"     (Southern Comfort)
-    0.38  → "38%"     (iStill)
-    0.43  → "43%"     (Roku Gin, Tyrconnell)
-    0.45  → "45%"     (Eagle Rare, Roe & Co)
-    0.2   → "20%"     (Midori Melon)
-    0.16  → "16%"     (Kahlua)
-
-  RULE: If value >= 1.0 → it is already the percentage. Append "%" sign only.
-    40   → "40%"
-    43.2 → "43.2%"
-    37.5 → "37.5%"
-
-  RULE: If ABV = 0 exactly → the product has no alcohol (soft drink, mixer).
-        Leave alcohol_percent blank ("") for these products.
-
-FREE TEXT patterns:
-  "40%"               → "40%"
-  "43.2% vol"         → "43.2%"
-  "40 ABV"            → "40%"
-  "12/100/17/DF/T2"   → "17%"  (third slash-segment)
-  "6x700ml 43%"       → "43%"
-  "Baileys 17% 12x1L" → "17%"
-
-OUTPUT FORMAT — MANDATORY:
-  • Always a string with "%" sign: "40%", "43.2%", "37.5%"
-  • NEVER output as decimal: 0.375, 0.4
-  • NEVER output without % sign: 40, 43.2
-  • If truly absent from ALL sources → "" (blank). NEVER output 0 or "0%".
-
-──────────────────────────────────────────────────────────────────
-A3. refillable_status — STRICT WHITELIST  ⚠️ CRITICAL ⚠️
-──────────────────────────────────────────────────────────────────
-ONLY populate refillable_status with these exact values when they are EXPLICITLY
-present in the source:
-  "REF" / "RF" / "Refillable"     → refillable_status: "REF"
-  "NRF" / "Non-Refillable"        → refillable_status: "NRF"
-
-⚠️ THE "Refil Status" COLUMN IS DUAL-PURPOSE — READ CAREFULLY:
-This column in Excel may contain packaging type values, NOT refillable status:
-
-  "REF"    → refillable_status: "REF"
-             (also set bottle_or_can_type: "bottle" if not otherwise stated)
-  "CAN"    → bottle_or_can_type: "can"
-             refillable_status: ""  ← DO NOT set refillable_status
-  "BOTTLE" → bottle_or_can_type: "bottle"
-             refillable_status: ""  ← DO NOT set refillable_status
-  blank / NaN → refillable_status: "", bottle_or_can_type: ""
-
-⚠️ NEVER DEFAULT TO "NRF". If the column is blank → leave refillable_status blank.
-⚠️ NEVER OUTPUT "NRF" unless the word "NRF" or "Non-Refillable" is explicitly written.
-
-──────────────────────────────────────────────────────────────────
-A4. custom_status — T1 / T2  ⚠️ MANDATORY ⚠️
-──────────────────────────────────────────────────────────────────
-Column names: "STATUS", "Status", "Custom Status", "Customs Status", "T1/T2"
-  • "T1" → custom_status: "T1"
-  • "T2" → custom_status: "T2"
-  • Also scan ALL text (headers, footers, notes) for "T1" or "T2".
-  • If a footer says "All T2" or "All T2 EAD" → apply custom_status: "T2" to ALL rows.
-  • If absent → ""
-
-──────────────────────────────────────────────────────────────────
-A5. unit_volume_ml — VOLUME NORMALISATION
-──────────────────────────────────────────────────────────────────
-Column names: "CONTENT", "Volume", "Size", "Cl", "ML", "Pack Size", "Vol"
-Always normalise to millilitres.
-
-VALUES IN CENTILITRES (cl) — multiply by 10:
-  70 → 700   | 100 → 1000 | 35 → 350  | 50 → 500  | 20 → 200
-  75 → 750   | 150 → 1500 | 200 → 2000| 125 → 1250| 35 → 350
-
-⚠️ CONTENT COLUMN DETECTION:
-If the column header is "CONTENT" or "Cl" and values are in the range 20–200:
-  → These are centilitres. Multiply by 10.
-  → 70 → 700ml, 100 → 1000ml, 35 → 350ml
-
-EXCEPTION for cans/RTDs — values like 500, 330, 275 in a context where
-the product is clearly a can or small RTD bottle:
-  → Treat as ml already (500ml can, 330ml bottle, 275ml bottle)
-  Rule of thumb: if value × 10 > 5000ml for a single consumer unit → already in ml.
-
-VALUES IN LITRES — multiply by 1000:
-  0.5L → 500 | 0.7L → 700 | 1L → 1000 | 0.375L → 375
-
-NEVER output decimals: 700 not 0.7, 375 not 0.375.
-
-──────────────────────────────────────────────────────────────────
-A6. currency — NORMALISATION
-──────────────────────────────────────────────────────────────────
-  "EURO", "Euro", "euro", "EURO " (trailing space), "€"  → "EUR"
-  "USD", "US$", "$"                                       → "USD"
-  "GBP", "£", "STG"                                       → "GBP"
-Strip all whitespace. If absent → "".
-
-──────────────────────────────────────────────────────────────────
-A7. incoterm & location — EXTRACTION & STANDARDISATION
-──────────────────────────────────────────────────────────────────
-Scan ALL text including headers, footers, and notes.
-
-Conversion rules:
-  "Ex Warehouse [City]"           → incoterm: "EXW", location: "[City]"
-  "Ex Warehouse Dublin, Ireland"  → incoterm: "EXW", location: "Dublin, Ireland"
-  "DAP LOE" / "DAP Loendersloot" → incoterm: "DAP", location: "Loendersloot bonded warehouse, Netherlands"
-  "EXW LOE"                       → incoterm: "EXW", location: "Loendersloot bonded warehouse, Netherlands"
-  "EXW Riga"                      → incoterm: "EXW", location: "Riga"
-  "FOB [Port]"                    → incoterm: "FOB", location: "[Port]"
-
-If a single incoterm applies to ALL products (found in footer/header):
-  → Apply that incoterm and location to every product row.
-
-If multiple incoterms appear:
-  → Create SEPARATE rows per incoterm, duplicate all other fields.
-  → Add "multiple_incoterms_detected" to error_flags.
-
-──────────────────────────────────────────────────────────────────
-A8. supplier_name — COMPANY NAME ONLY
-──────────────────────────────────────────────────────────────────
-Extract from (priority order):
-  1. Official company name in file header / footer
-  2. Email signature company name
-  3. "Offer from <Company>" in body
-  4. Sheet/file title if it contains a company name
-NEVER use person names, sales desk names, or email usernames.
-If none found → "".
-
-──────────────────────────────────────────────────────────────────
-A9. supplier_reference — OVERRIDE RULE  ⚠️
-──────────────────────────────────────────────────────────────────
-Scan EVERY column and piece of text. If found, MUST write to supplier_reference.
-
-Column names to scan:
-  "P.Code", "P Code", "Ref", "Reference", "Ref No", "Supplier Ref",
-  "Offer Ref", "Offer No", "SKU", "Item Code", "Product Code",
-  "Stock Code", "Art No", "Article", "Code", "Barcode"
-
-Inline patterns:
-  "Ref: ABC123"      → supplier_reference: "ABC123"
-  "P.Code: 400206"   → supplier_reference: "400206"
-  "Offer No: X001"   → supplier_reference: "X001"
-
-If absent → "".
-
-──────────────────────────────────────────────────────────────────
-A10. quantity_case
-──────────────────────────────────────────────────────────────────
-Column names: "CASES", "Qty", "Quantity", "Cases", "QTY"
-  • Populate ONLY if total case count is explicitly stated as a number.
-  • "5 FCL" / "4 FCL" (Full Container Load) → DO NOT extract as quantity_case.
-    Leave null and add "fcl_quantity_not_extracted" to error_flags.
-  • "12x750ml" describes PACKAGING, NOT quantity.
-  • If absent → null.
-
-──────────────────────────────────────────────────────────────────
-A11. cases_per_pallet
-──────────────────────────────────────────────────────────────────
-Populate ONLY when explicitly stated: "60 cases per pallet", "60 cs/pallet".
-"FTL" / "FCL" → do NOT populate. If absent → null.
-
-──────────────────────────────────────────────────────────────────
-A12. lead_time / availability
-──────────────────────────────────────────────────────────────────
-Column names: "Availability", "Lead Time", "LT", "Delivery", "Stock"
-Extract exactly as written: "Stock", "2 Weeks", "2 WEEKS", "1 Week", "STOCK".
-Do NOT rewrite or normalise.
-
-──────────────────────────────────────────────────────────────────
-A13. moq_cases / min_order_quantity_case
-──────────────────────────────────────────────────────────────────
-If MOQ not explicitly stated → null. NEVER default to 0.
-
-──────────────────────────────────────────────────────────────────
-A14. price fields
-──────────────────────────────────────────────────────────────────
-  "PRICE CASE" / "Price/Case" / "Case Price"            → price_per_case
-  "PRICE BOTTLE" / "Price/Btl" / "Bottle Price" / "Unit Price" → price_per_unit
-
-If price_per_case not in source → null. Do NOT calculate.
-price_per_unit_eur and price_per_case_eur → always null (backend calculates these).
-Comma decimal: "42,5" → 42.5.
-
-Free text price patterns:
-  "15.95eur" → price_per_case: 15.95, currency: "EUR"
-  "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
-  "$15.95" → price_per_case: 15.95, currency: "USD"
-  "£11.40/btl" → price_per_unit: 11.40, currency: "GBP"
-
-──────────────────────────────────────────────────────────────────
-A15. best_before_date
-──────────────────────────────────────────────────────────────────
-  "9/2026" → "2026-09-01" | "BBD 03.06.2026" → "2026-06-03" | "fresh" → "fresh"
-These are NOT lead_time.
-
-──────────────────────────────────────────────────────────────────
-A16. label_language
-──────────────────────────────────────────────────────────────────
-Only when explicitly mentioned:
-  "UK text" → "EN" | "SA label" → "multiple" | "multi text" → "multiple"
-If absent → "".
-
-──────────────────────────────────────────────────────────────────
-A17. ean_code / barcode
-──────────────────────────────────────────────────────────────────
-Column names: "Barcode Bottle", "Barcode", "EAN", "EAN Code", "GTIN"
-Extract numeric barcode as string. If NaN / absent → "".
-
-──────────────────────────────────────────────────────────────────
-A18. confidence_score
-──────────────────────────────────────────────────────────────────
-Start at 1.0. Deduct 0.1 for each:
-  • sub_category inferred (not written)
-  • incoterm converted / standardised
-  • unit_volume_ml converted from cl or L
-  • supplier_name inferred from signature
-  • alcohol_percent converted from decimal fraction
-  • any ambiguous field
-Minimum: 0.0.
-
-──────────────────────────────────────────────────────────────────
-A19. error_flags
-──────────────────────────────────────────────────────────────────
-Add strings to error_flags[] when:
-  • Multiple incoterms        → "multiple_incoterms_detected"
-  • Currency missing          → "missing_currency"
-  • Volume unit ambiguous     → "ambiguous_volume"
-  • Supplier unclear          → "supplier_unclear"
-  • Sub-category inferred     → "sub_category_inferred"
-  • ABV converted from decimal→ "abv_converted_from_decimal"
-  • FCL quantity found        → "fcl_quantity_not_extracted"
-
-──────────────────────────────────────────────────────────────────
-A20. SOURCE FIELDS — NEVER MODIFY
-──────────────────────────────────────────────────────────────────
-NEVER modify: source_channel, source_filename, source_message_id.
-
-──────────────────────────────────────────────────────────────────
-A21. STRICT EXTRACTION PRINCIPLE
-──────────────────────────────────────────────────────────────────
-Extract ONLY what is explicitly written OR confidently inferred by the
-classification logic in this prompt. NEVER assume or fabricate.
-
-  Not present             → blank
-  Present clearly         → extract as-is
-  Multiple incoterms      → split rows
-  Needs normalisation     → normalise per rules above
-  Ambiguous               → blank + add error_flag
-
-════════════════════════════════════════════════════════════════════
-SECTION B — CATEGORY & SUB-CATEGORY CLASSIFICATION
-════════════════════════════════════════════════════════════════════
-Section headers in Excel (e.g. "SPIRITS", "BEER", "RTDS") set the category
-for all rows that follow until the next section header.
-
-  Category      Sub-category        Brand / Product examples
-  ──────────── ─────────────────── ───────────────────────────────────────────
-  Spirits       Cognac              Hennessy, Martell, Rémy Martin, Courvoisier,
-                                    Courvoiser (common misspelling)
-  Spirits       Rum                 Bacardi, Captain Morgan, Havana Club, Kraken
-  Spirits       Vodka               Absolut, Grey Goose, Smirnoff, Belvedere,
-                                    Finlandia, Tito's, iStill, Smrnoff (typo)
-  Spirits       Whisky (Scotch)     Johnnie Walker, Chivas, Glenfiddich, Macallan,
-                                    Famous Grouse, Laphroaig
-  Spirits       Whiskey (American)  Jack Daniel's, Jim Beam, Maker's Mark,
-                                    Buffalo Trace, Eagle Rare, Fireball,
-                                    Southern Comfort, Jack Daniels (no apostrophe)
-  Spirits       Irish Whiskey       Jameson, Bushmills, Tullamore Dew, Paddy,
-                                    Kilbeggan, Connemara, Black Bush, Teeling,
-                                    Tyrconnell, Yellow Spot, Roe & Co,
-                                    O'Driscoll's, Grace O'Malley, Dingle Single Malt
-  Spirits       Gin                 Gordon's, Tanqueray, Bombay, Hendrick's,
-                                    Beefeater, Dingle Gin, Boatyard, Roku
-  Spirits       Tequila             Cincoro, Jose Cuervo, Patron, Don Julio
-  Spirits       Liqueur             Baileys, Kahlua, Licor 43, Midori, Malibu,
-                                    Aftershock, Amaretto
-  Wine          Vermouth            Martini Bianco, Martini Rosso, Martini Extra Dry
-  Wine          Champagne           Moët, Veuve Clicquot, Laurent-Perrier
-  Wine          Red Wine            (red wine products)
-  Wine          White Wine          (white wine products)
-  Beer          Lager               Carlsberg, Carling, Peroni, Zyweic, Heineken
-  Beer          RTD / Alcopop       WKD Blue, WKD Cherry, WKD Iron Brew, WKD Pineapple
-  Soft Drinks   Cola                Coca Cola, Coke Zero, Diet Coke, Pepsi
-  Soft Drinks   Mixer               Schweppes Tonic, Schweppes Ginger Ale,
-                                    Schweppes Soda Water, Fanta, Sprite
-
-If sub-category cannot be confidently determined → "" (blank). NEVER "Not Found".
-
-════════════════════════════════════════════════════════════════════
-SECTION C — EXCEL COLUMN MAPPING (standard stock offer format)
-════════════════════════════════════════════════════════════════════
-The actual column headers may be in a row other than row 0.
-Identify the header row first (it contains labels like CASES, PRODUCT, P.Code, ABV).
-
-  Excel Column    → Schema Field           Notes
-  ─────────────── → ───────────────────── ─────────────────────────────────────
-  CASES           → quantity_case          Numeric value only. "5 FCL" → null
-  PRODUCT         → product_name           Also infer brand from this value
-  P.Code          → supplier_reference     Also set product_reference to same value
-  CASE            → units_per_case         Number of bottles/cans per case
-  CONTENT         → unit_volume_ml         ⚠️ In CENTILITRES → multiply by 10
-                                            70→700, 100→1000, 35→350, 50→500, 20→200
-                                            Exception: 500, 330, 275 for cans → ml already
-  ABV             → alcohol_percent        ⚠️ DECIMAL FRACTION → multiply by 100
-                                            0.4→"40%", 0.375→"37.5%", 0.17→"17%"
-                                            ABV=0 → soft drink → alcohol_percent: ""
-  PRICE CASE      → price_per_case         Numeric price per case
-  PRICE BOTTLE    → price_per_unit         Numeric price per bottle/unit
-  Refil Status    → DUAL PURPOSE:
-                    "REF"    → refillable_status:"REF", bottle_or_can_type:"bottle"
-                    "CAN"    → bottle_or_can_type:"can", refillable_status:""
-                    "BOTTLE" → bottle_or_can_type:"bottle", refillable_status:""
-                    blank    → refillable_status:"", bottle_or_can_type:""
-  Currency        → currency               "EURO" or "EURO " → "EUR"
-  Availability    → lead_time              Exact string: "Stock", "2 Weeks", "1 Week"
-  STATUS          → custom_status          "T2"→"T2", "T1"→"T1"
-  Barcode Bottle  → ean_code              String. NaN → ""
-
-packaging FIELD: Construct from units_per_case + unit_volume_ml:
-  units_per_case=6, unit_volume_ml=700 → packaging: "6x700ml"
-  units_per_case=24, unit_volume_ml=500 → packaging: "24x500ml"
-
-SKIP THESE ROW TYPES (do not create a product entry):
-  • Rows where the PRODUCT column contains only a section name:
-    "SPIRITS", "BEER", "RTDS", "MINERALS - NRB GLASS", "WINES", etc.
-  • Rows where ALL cells are blank / NaN
-  • Footer/note rows (contain text like "All T2 EAD", "Ex Warehouse", "As at...")
-
-EXTRACT METADATA FROM FOOTER ROWS (do not skip the info, just skip the row as product):
-  • "Ex Warehouse Dublin, Ireland." → incoterm: "EXW", location: "Dublin, Ireland"
-  • "All T2 EAD - Refillable European Stock" → custom_status_default: "T2"
-    (apply T2 to all rows that don't have their own STATUS value)
-
-════════════════════════════════════════════════════════════════════
-SECTION D — PDF & IMAGE EXTRACTION
-════════════════════════════════════════════════════════════════════
-When source is a PDF or image:
-  • Extract all tabular data as if it were an Excel file.
-  • Apply all rules from Sections A and B.
-  • Look for column headers explicitly; if not found, infer from context.
-  • Incoterms and supplier names are often in headers, footers, or signatures.
-  • Apply the same ABV decimal detection rule.
-    Known brand ABVs can help verify (Baileys=17%, Bacardi=37.5% or 40%).
-
-════════════════════════════════════════════════════════════════════
-SECTION E — OUTPUT SCHEMA
-════════════════════════════════════════════════════════════════════
-Return ONLY: {"products": [...]}
-No explanation, no markdown, no preamble — pure JSON only.
-
-Missing string fields → "" | Missing numeric fields → null
-confidence_score → float 0.0–1.0 | error_flags → [] | needs_manual_review → boolean
-
-Field list (exact names — include ALL even if blank):
-  uid, product_key, processing_version, brand, product_name, product_reference,
-  category, sub_category, origin_country, vintage, alcohol_percent, packaging,
-  unit_volume_ml, units_per_case, cases_per_pallet, quantity_case,
-  bottle_or_can_type, price_per_unit, price_per_case, currency,
-  price_per_unit_eur, price_per_case_eur, incoterm, location,
-  min_order_quantity_case, port, lead_time, supplier_name, supplier_reference,
-  supplier_country, offer_date, valid_until, date_received, source_channel,
-  source_filename, source_message_id, confidence_score, error_flags,
-  needs_manual_review, best_before_date, label_language, ean_code,
-  gift_box, refillable_status, custom_status, moq_cases
-
-product_key → UPPERCASE_WITH_UNDERSCORES: BRAND_NAME_VOLUME_PACKAGING
-  e.g. BACARDI_6X1000ML, BAILEYS_12X700ML
-uid, processing_version → "" (populated by backend)
-price_per_unit_eur, price_per_case_eur → null (calculated by backend)
-"""
-
-
-# =============================================================================
-# Helper: user-turn prompt for free-text / email / PDF content
-# =============================================================================
-def _build_text_user_prompt(chunk: str, idx: int, total: int) -> str:
-    return f"""Extract ALL commercial alcohol/beverage products from the source text below.
-Return ONLY a JSON object with a 'products' array. No explanations, no markdown.
-
-Critical reminders before you start:
-1. alcohol_percent — MANDATORY:
-   • ABV column values < 1.0 are decimal fractions → multiply by 100
-     (0.4 → "40%", 0.375 → "37.5%", 0.17 → "17%")
-   • Always output with % sign. ABV=0 → soft drink → leave blank.
-2. custom_status — scan every column and text for T1 / T2. Check "STATUS" column.
-3. refillable_status — STRICT:
-   • "CAN" in Refil Status → bottle_or_can_type:"can", refillable_status:""
-   • "BOTTLE" → bottle_or_can_type:"bottle", refillable_status:""
-   • "REF" → refillable_status:"REF"
-   • Blank → both fields blank. NEVER output "NRF" unless explicitly written.
-4. supplier_reference — scan for P.Code, Ref, SKU, Item Code, Product Code.
-5. unit_volume_ml — CONTENT column is in cl → multiply by 10 (70→700, 100→1000).
-6. currency — "EURO" or "EURO " → "EUR".
-7. Skip section header rows and blank rows. Extract incoterm/status from footers.
-
-Text Chunk ({idx + 1}/{total}):
-{chunk}
-"""
-
-
-# =============================================================================
-# Helper: user-turn prompt for Excel batch rows
-# =============================================================================
-def _build_excel_user_prompt(data_rows: list, batch_start: int, batch_end: int,
-                              total_rows: int, global_context: dict = None) -> str:
-    context_block = ""
-    if global_context:
-        context_block = f"""
-Global context from this file (apply to ALL products unless a row overrides it):
-{json.dumps(global_context, indent=2)}
-
-"""
-    return f"""Extract products from these Excel rows ({batch_start + 1}–{batch_end} of {total_rows}).
-Return ONLY a JSON object with a 'products' array. No explanations, no markdown.
-{context_block}
-⚠️ MANDATORY EXTRACTION RULES FOR THESE ROWS:
-
-1. alcohol_percent — "ABV" column stores DECIMAL FRACTIONS. ALWAYS multiply by 100:
-   0.4→"40%"  0.375→"37.5%"  0.17→"17%"  0.46→"46%"  0.463→"46.3%"
-   0.3→"30%"  0.15→"15%"     0.04→"4%"   0.034→"3.4%" 0.055→"5.5%"
-   0.33→"33%" 0.35→"35%"     0.38→"38%"  0.43→"43%"   0.45→"45%"
-   0.414→"41.4%"  0.425→"42.5%"  0.31→"31%"  0.2→"20%"  0.16→"16%"
-   ABV=0 → soft drink → alcohol_percent: "" (blank)
-
-2. custom_status — "STATUS" column: extract "T2" or "T1" directly as-is.
-
-3. refillable_status — "Refil Status" column DUAL-PURPOSE:
-   "REF"    → refillable_status:"REF",   bottle_or_can_type:"bottle"
-   "CAN"    → bottle_or_can_type:"can",  refillable_status:""
-   "BOTTLE" → bottle_or_can_type:"bottle", refillable_status:""
-   blank    → refillable_status:"",      bottle_or_can_type:""
-   ⚠️ NEVER output "NRF" unless the source text literally says "NRF".
-
-4. unit_volume_ml — "CONTENT" column is in CENTILITRES → multiply by 10:
-   70→700  100→1000  35→350  50→500  20→200  75→750  150→1500  200→2000
-   Exception: 500, 330, 275 in RTD/can context → treat as ml already.
-
-5. currency — "EURO" or "EURO " (trailing space) → output "EUR".
-
-6. supplier_reference — "P.Code" column → extract the code value.
-   Also set product_reference to the same value.
-
-7. quantity_case — "CASES" column → extract numeric value only.
-   "5 FCL", "4 FCL", "1 FCL" etc. → quantity_case: null, add "fcl_quantity_not_extracted" to error_flags.
-
-8. packaging — construct from units_per_case + unit_volume_ml:
-   units_per_case=6, unit_volume_ml=700 → packaging:"6x700ml"
-
-9. SKIP these rows entirely (do not create a product entry):
-   • Row where PRODUCT cell contains only: "SPIRITS", "BEER", "RTDS",
-     "MINERALS - NRB GLASS", "WINES", or any other section label
-   • Rows where ALL cells are blank / empty string
-   • Footer/note rows (contain: "All T2 EAD", "Ex Warehouse", "As at...",
-     "All goods are in stock", "subject unsold")
-
-10. ean_code — "Barcode Bottle" column → extract as string, "" if NaN.
-
-Excel rows (JSON):
-{json.dumps(data_rows, indent=2)}
-"""
-
-
-# =============================================================================
-# Helper: extract global context from the full Excel dataframe
-# =============================================================================
-def _extract_excel_global_context(df: pd.DataFrame) -> dict:
-    """
-    Scan all rows for footer/header metadata:
-    incoterm, supplier info, global custom_status, offer date.
-    """
-    context = {}
-    all_text_values = []
-    for val in df.values.flatten():
-        s = str(val).strip()
-        if s and s.lower() not in ("nan", "none", ""):
-            all_text_values.append(s)
-    full_text = " ".join(all_text_values)
-
-    # Incoterm detection
-    exw_match = re.search(
-        r"ex\s+warehouse\s+([\w\s,]+?)(?:\.|,\s*Ireland|\s*$)",
-        full_text, re.IGNORECASE
-    )
-    if exw_match:
-        loc = exw_match.group(1).strip().rstrip(",.")
-        # Check if "Ireland" follows
-        ireland_match = re.search(
-            r"ex\s+warehouse\s+([\w\s,]+?Ireland)", full_text, re.IGNORECASE)
-        if ireland_match:
-            loc = ireland_match.group(1).strip().rstrip(",.")
-        context["incoterm"] = "EXW"
-        context["location"] = loc
-    else:
-        inc_match = re.search(
-            r"\b(EXW|FOB|CIF|DAP|DDP|FCA|CPT|CFR)\s+([\w\s,]+?)(?:\.|,|$)",
-            full_text, re.IGNORECASE
-        )
-        if inc_match:
-            context["incoterm"] = inc_match.group(1).upper()
-            context["location"] = inc_match.group(2).strip().rstrip(",.")
-
-    # Global T1/T2 default
-    if re.search(r"\bAll\s+T2\b", full_text, re.IGNORECASE):
-        context["custom_status_default"] = "T2"
-    elif re.search(r"\bAll\s+T1\b", full_text, re.IGNORECASE):
-        context["custom_status_default"] = "T1"
-
-    # Offer date from header
-    date_match = re.search(
-        r"Offer\s+(\d{1,2}[./]\d{1,2}[./]\d{4})", full_text, re.IGNORECASE)
-    if date_match:
-        context["offer_date"] = date_match.group(1)
-
-    logger.info(f"Extracted global Excel context: {context}")
-    return context
-
-
 async def extract_offer(text: str) -> dict:
     logger.info(f"extract_offer called with text length: {len(text)}")
     logger.debug(f"extract_offer text preview: {text[:200]}...")
 
+    # Maximum characters per chunk to prevent context overflow (roughly 5000 tokens)
+    # Using characters vs tokens as a rough generic heuristic
     CHUNK_SIZE = 25000
-    text_chunks = (
-        [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-        if len(text) > CHUNK_SIZE
-        else [text]
-    )
+
+    # Split text into manageable chunks
+    text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)] if len(text) > CHUNK_SIZE else [
+        text]
     logger.info(f"Split input text into {len(text_chunks)} chunk(s).")
 
     all_products = []
 
     for idx, chunk in enumerate(text_chunks):
         logger.info(f"Processing chunk {idx + 1} of {len(text_chunks)}...")
+
+        prompt = f"""
+        You are extracting commercial alcohol offers from text.
+        Return JSON ONLY, no explanation.
+
+        Extract ALL products from the text. Return a JSON object with a 'products' array containing ALL products found.
+
+        SCHEMA DEFINITION - Use EXACTLY these field names and rules:
+        - uid: Unique internal ID for each row (DO NOT generate - leave as "Not Found")
+        - product_key: Logical ID for deduplication (brand + name + volume + packaging). UPPERCASE with underscores.
+        - processing_version: Backend version used (leave as "Not Found")
+        - brand: Brand or trademark of the product.
+        - product_name: Commercial product name.
+        - product_reference: Supplier or internal reference/SKU.
+        - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
+        - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
+        - origin_country: Country of origin (ISO 2 code or full name).
+        - vintage: Vintage year (for wine/champagne).
+        - alcohol_percent: Alcohol percentage if applicable.
+        - packaging: Full packaging description (e.g. 6x750ml).
+        - unit_volume_ml: Volume per unit in milliliters (convert CL: 75CL = 750ml).
+        - units_per_case: Number of units (bottles/cans) per case.
+        - cases_per_pallet: Number of cases per pallet.
+        - quantity_case: Number of cases offered or ordered.
+        - bottle_or_can_type: Packaging type (bottle/can/other).
+        - price_per_unit: Unit price.
+        - price_per_case: Case price.
+        - currency: Currency (EUR, USD, GBP...).
+        - price_per_unit_eur: Unit price converted into EUR.
+        - price_per_case_eur: Case price converted into EUR.
+        - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
+        - location: Location/port associated with the incoterm.
+        - min_order_quantity_case: Minimum order quantity in cases.
+        - port: Port of loading/destination if applicable.
+        - lead_time: Lead time or availability.
+        - supplier_name: Name of the supplier (leave as "Not Found").
+        - supplier_reference: Supplier offer reference.
+        - supplier_country: Supplier's country.
+        - offer_date: Date of the offer (leave as "Not Found").
+        - valid_until: Offer validity date.
+        - date_received: Actual timestamp when received (leave as "Not Found").
+        - source_channel: Source of data (leave as "Not Found").
+        - source_filename: Name of the received file (leave as "Not Found").
+        - source_message_id: Message ID (leave as "Not Found").
+        - confidence_score: Confidence indicator AI (leave as 0.0).
+        - error_flags: List of errors detected (leave as empty array []).
+        - needs_manual_review: Boolean indicating if review needed (leave as false).
+        - best_before_date: Best before date (date or 'fresh').
+        - label_language: Languages on label (e.g. 'UK text', 'SA label').
+        - ean_code: EAN product barcode.
+        - gift_box: Indicates if product includes gift box (GBX).
+        - refillable_status: REF/NRF: refillable or non‑refillable.
+        - custom_status: Customs status: T1 or T2.
+        - moq_cases: Minimum order quantity stated in the offer.
+
+        CRITICAL RULES FOR MISSING VALUES:
+        1. If a field is NOT explicitly stated in the text, return "Not Found". Do NOT invent or hallucinate values.
+        2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
+        3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
+        4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
+        5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
+        6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
+        7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
+        8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
+        9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
+        10. Never hallucinate quantities. If you're unsure, use "Not Found".
+
+        IMPORTANT RULES:
+        1. Extract ALL products mentioned in the text. Return one object per product in the 'products' array.
+        2. CAPTURE FULL NAMES: 'Baileys Original' is the product_name, not just 'Original'.
+        3. If you find multiple quantities/prices for one product, create separate entries if they look like distinct offers.
+        4. If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
+        5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
+        6. DO NOT use null for any field - always use "Not Found" for missing values.
+        7. Use AI to intelligently match values to fields - if something in email matches a field, extract it
+
+        PRICE INTERPRETATION:
+        - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
+        - "11,40eur/btl" → price_per_unit: 11.40
+        - "32,50eur/cs" → price_per_case: 32.50
+
+        QUANTITY EXTRACTION:
+        - "960 cs" → quantity_case: 960
+        - "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
+        - "1932cs" → quantity_case: 1932
+        - If quantity not specified, return "Not Found". Do NOT default to 0.
+        - IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
+        - quantity_case is the total number of cases offered, not the packaging configuration.
+        - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
+
+        ALCOHOL PERCENT - CRITICAL INSTRUCTION:
+        - Extract the alcohol percentage exactly as it appears in the source text.
+        - If the text shows "40%" → output alcohol_percent: 40
+        - If the text shows "5%" → output alcohol_percent: 5  
+        - If the text shows "17%" → output alcohol_percent: 17
+        - If the text shows "40" (without % sign) → output alcohol_percent: 40
+        - If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
+        - If the text shows "40.0" → output alcohol_percent: 40.0
+        - NEVER perform any mathematical conversion or multiplication on the alcohol value.
+        - NEVER change 0.4 to 40 - keep it exactly as 0.4.
+        - If alcohol percentage is not found in the text, return "Not Found".
+        - Do NOT default to 0 when alcohol percentage is missing.
+
+        CASES_PER_PALLET - CRITICAL RULE:
+        - Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
+        - Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
+        - If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
+        - If not explicitly stated, cases_per_pallet must be "Not Found".
+        - If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
+
+        QUANTITY_CASE - CRITICAL RULE:
+        - Only populate quantity_case if the total number of cases is EXPLICITLY stated.
+        - Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
+        - Do NOT derive quantity_case from packaging information like "12x750ml".
+        - "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
+        - If quantity_case is not explicitly stated, it must be "Not Found".
+        - If quantity_case = 0, that means "Not Found" - treat as "Not Found".
+
+        SUPPLIER NAME EXTRACTION:
+        - Attempt to extract in this exact priority:
+          1. Extract from file content itself.
+          2. Extract from email body (e.g., "Offer from MILANAKO company").
+          3. Extract from forwarded email signature block.
+        - If none found in those places, return "Not Found". DO NOT default to the email sender.
+
+        INCOTERM & LOCATION:
+        - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
+        - If no incoterm or location found, return "Not Found".
+
+        DATE FIELDS:
+        - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
+        - "BBD 03.06.2026" → best_before_date: "2026-06-03"
+        - "fresh" → best_before_date: "fresh"
+        - These are NOT lead_time
+
+        CUSTOM STATUS:
+        - "T1" → custom_status: "T1"
+        - "T2" → custom_status: "T2"
+
+        PACKAGING_RAW:
+        - "cans" → packaging_raw: "can"
+        - "btls" or "bottle" → packaging_raw: "bottle"
+
+        LABEL LANGUAGE:
+        - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
+        - "UK text" → label_language: "EN"
+        - "SA label" → label_language: "multiple" 
+        - "multi text" → label_language: "multiple"
+        - If not mentioned, return "Not Found".
+
+        COMMON PATTERNS IN EMAILS:
+        - "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
+        - "6x70" → units_per_case: 6, unit_volume_ml: 700
+        - "24x50cl cans" → units_per_case: 24, unit_volume_ml: 500, bottle_or_can_type: "can"
+        - "960 cs" → quantity_case: 960
+        - "98,5€" → price_per_case: 98.5, currency: "EUR"
+        - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
+        - "EXW Loendersloot" → incoterm: "EXW", location: "Loendersloot bonded warehouse in Netherlands"
+        - "DAP LOE" → incoterm: "DAP", location: "Loendersloot bonded warehouse in Netherlands"
+        - "5 weeks LT" → lead_time: "5 weeks"
+        - "BBD 03.06.2026" → best_before_date: "2026-06-03"
+        - "fresh" → best_before_date: "fresh"
+        - "UK text" → label_language: "EN"
+        - "SA label" → label_language: "multiple"
+        - "T1" or "T2" → custom_status: "T1" or "T2"
+        - "REF" → refillable_status: "REF"
+        - "NRF" → refillable_status: "NRF"
+
+        CATEGORY DETECTION:
+        - Whisky/Whiskey/Scotch/Bourbon → category: "Spirits", sub_category: "Whisky"
+        - Champagne/Sparkling → category: "Wine", sub_category: "Champagne"
+        - Wine/Red/White → category: "Wine", sub_category: (red/white/rose)
+        - Beer/Lager/Ale → category: "Beer", sub_category: (lager/ale/stout)
+        - Cognac/Brandy → category: "Spirits", sub_category: "Brandy"
+        - Vodka/Gin/Rum → category: "Spirits", sub_category: (vodka/gin/rum)
+        - Liqueur → category: "Spirits", sub_category: "Liqueur"
+        - Soft Drinks/Energy Drinks → category: "Soft Drinks"
+        - Food → category: "Food"
+
+        REMEMBER: 
+        - When in doubt, use "Not Found". 
+        - Never invent numbers. 
+        - Only extract what is explicitly stated. 
+        - If a value is 0, that means "Not Found" - treat as "Not Found".
+        - Use "Not Found" for ALL missing fields - both strings AND numbers.
+
+        Text Chunk ({idx + 1}/{len(text_chunks)}):
+        {chunk}
+        """
+
         try:
+            logger.info("Calling OpenAI API for text extraction chunk...")
             response = await client.chat.completions.create(
                 model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": MASTER_SYSTEM_PROMPT},
-                    {"role": "user", "content": _build_text_user_prompt(chunk, idx, len(text_chunks))}
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.0,
                 max_tokens=4096
             )
+
             content = response.choices[0].message.content
-            logger.info(f"Response for chunk {idx + 1}, length: {len(content)}")
+            logger.info(f"OpenAI response received for chunk {idx + 1}, length: {len(content)}")
 
             result = json.loads(content)
             products = result.get('products', [])
-            cleaned = [clean_product_data(p) for p in products]
-            all_products.extend(cleaned)
-            logger.info(f"Chunk {idx + 1} yielded {len(cleaned)} products.")
+
+            cleaned_products = []
+            for product in products:
+                # Clean product nulls
+                for key in product:
+                    if product[key] is None:
+                        numeric_fields = [
+                            'unit_volume_ml', 'units_per_case', 'cases_per_pallet',
+                            'quantity_case', 'price_per_unit', 'price_per_unit_eur',
+                            'price_per_case', 'price_per_case_eur', 'fx_rate',
+                            'alcohol_percent', 'moq_cases'
+                        ]
+                        if key in numeric_fields:
+                            product[key] = "Not Found"
+                        else:
+                            product[key] = "Not Found"
+
+                cleaned_product = clean_product_data(product)
+                cleaned_products.append(cleaned_product)
+
+            all_products.extend(cleaned_products)
+            logger.info(f"Chunk {idx + 1} yielded {len(cleaned_products)} products.")
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error chunk {idx + 1}: {e}")
+            logger.error(f"JSON decode error in extract_offer for chunk {idx + 1}: {e}")
             continue
         except Exception as e:
-            logger.error(f"Error chunk {idx + 1}: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error extracting from text chunk {idx + 1}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             continue
 
-    # Convert prices to EUR
-    logger.info("Converting prices to EUR...")
-    for product in all_products:
-        currency = product.get('currency', "")
-        if currency in ["", None, "EUR"]:
-            product['price_per_unit_eur'] = product.get('price_per_unit')
-            product['price_per_case_eur'] = product.get('price_per_case')
-            continue
-        exchange_rate = await get_exchange_rate_to_eur(currency)
-        if product.get('price_per_unit') not in [None, "", 0]:
-            product['price_per_unit_eur'] = convert_price_to_eur(
-                product['price_per_unit'], currency, exchange_rate)
-        if product.get('price_per_case') not in [None, "", 0]:
-            product['price_per_case_eur'] = convert_price_to_eur(
-                product['price_per_case'], currency, exchange_rate)
-
-    logger.info(f"extract_offer completed. Total products: {len(all_products)}")
+    logger.info(f"extract_offer completed successfully. Total products aggregated: {len(all_products)}")
     return {"products": all_products}
 
 
 async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]:
-    logger.info(f"extract_from_file: {file_path}, {content_type}")
+    logger.info(f"extract_from_file called with file_path: {file_path}, content_type: {content_type}")
 
     try:
         text_content = ""
 
-        # ── EXCEL ──────────────────────────────────────────────────────────
         if content_type in [
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'application/vnd.ms-excel',
@@ -718,28 +287,53 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
         ] or file_path.lower().endswith(('.xlsx', '.xls', '.xlsm')):
             logger.info("Processing Excel file...")
             try:
-                if not os.path.exists(file_path):
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    file_ext = os.path.splitext(file_path)[1].lower()
+                    logger.info(f"File exists, size: {file_size} bytes, extension: {file_ext}")
+
+                    if file_ext == '.xlsm':
+                        logger.info("Processing XLSM (Macro-Enabled Excel) file...")
+                else:
+                    logger.error(f"File does not exist: {file_path}")
                     return {"error": f"File not found: {file_path}"}
 
-                file_ext = os.path.splitext(file_path)[1].lower()
-                logger.info(f"File size: {os.path.getsize(file_path)} bytes, ext: {file_ext}")
+                logger.info("Reading Excel file with pandas...")
 
                 try:
-                    if file_ext == '.xls':
-                        df = pd.read_excel(file_path, engine='xlrd', header=None)
+                    if file_path.lower().endswith('.xls'):
+                        df = pd.read_excel(file_path, engine='xlrd')
+                    elif file_path.lower().endswith('.xlsm'):
+                        df = pd.read_excel(file_path, engine='openpyxl')
                     else:
-                        df = pd.read_excel(file_path, engine='openpyxl', header=None)
+                        df = pd.read_excel(file_path, engine='openpyxl')
                 except Exception as read_error:
-                    logger.warning(f"Primary read failed: {read_error}. Trying fallback...")
-                    df = pd.read_excel(file_path, header=None)
+                    logger.warning(f"Primary read method failed: {read_error}")
+                    logger.info("Trying fallback read method...")
+                    df = pd.read_excel(file_path)
 
-                logger.info(f"Excel loaded. Shape: {df.shape}")
+                logger.info(f"Excel file loaded successfully. Shape: {df.shape}")
+                logger.info(f"Columns: {list(df.columns)}")
+
+                # Log first few rows for debugging
+                if len(df) > 0:
+                    logger.debug(f"First 3 rows:\n{df.head(3).to_string()}")
+                else:
+                    logger.warning("DataFrame is empty after loading")
 
                 if df.empty:
+                    logger.warning("Excel file is empty")
                     return {"error": "Excel file is empty"}
 
-                global_context = _extract_excel_global_context(df)
                 total_rows = len(df)
+                logger.info(f"Total rows in Excel: {total_rows}")
+
+                logger.debug(f"DataFrame dtypes:\n{df.dtypes}")
+
+                for col in df.columns:
+                    sample_data = df[col].head(3).tolist()
+                    logger.debug(f"Column '{col}' sample data: {sample_data}")
+
                 batch_size = 6
                 all_extracted_products = []
                 processed_row_count = 0
@@ -749,37 +343,195 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     batch_df = df.iloc[batch_start:batch_end]
 
                     logger.info(
-                        f"Batch {batch_start // batch_size + 1}: "
-                        f"rows {batch_start}–{batch_end - 1}")
+                        f"Processing batch {batch_start // batch_size + 1}: rows {batch_start} to {batch_end - 1} ({len(batch_df)} rows)")
 
                     data_rows = []
                     for idx, row in batch_df.iterrows():
-                        row_dict = {
-                            str(col): ("" if pd.isna(row[col]) else str(row[col]))
-                            for col in batch_df.columns
-                        }
+                        row_dict = {}
+                        for col in batch_df.columns:
+                            value = row[col]
+                            if pd.isna(value):
+                                row_dict[col] = ""
+                            else:
+                                row_dict[col] = str(value)
                         data_rows.append(row_dict)
 
+                    batch_text = f"""
+                    EXCEL DATA BATCH ({batch_start + 1}-{batch_end} of {total_rows}):
+
+                    Extract EXACTLY {len(batch_df)} products from this data:
+
+                    {json.dumps(data_rows, indent=2)}
+
+                    SCHEMA DEFINITION - Use EXACTLY these field names:
+                    - uid: (leave as "Not Found")
+                    - product_key: UPPERCASE(brand + name + volume + packaging)
+                    - processing_version: (leave as "Not Found")
+                    - brand: Brand or trademark of the product.
+                    - product_name: Commercial product name.
+                    - product_reference: Supplier or internal reference/SKU.
+                    - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
+                    - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
+                    - origin_country: Country of origin (ISO 2 code or full name).
+                    - vintage: Vintage year (for wine/champagne).
+                    - alcohol_percent: Alcohol percentage if applicable.
+                    - packaging: Full packaging description (e.g. 6x750ml).
+                    - unit_volume_ml: Volume per unit in milliliters (convert CL).
+                    - units_per_case: Number of units per case.
+                    - cases_per_pallet: Number of cases per pallet.
+                    - quantity_case: Number of cases offered or ordered.
+                    - bottle_or_can_type: Packaging type (bottle/can/other).
+                    - price_per_unit: Unit price.
+                    - price_per_case: Case price.
+                    - currency: Currency (EUR, USD, GBP...).
+                    - price_per_unit_eur: Unit price in EUR.
+                    - price_per_case_eur: Case price in EUR.
+                    - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
+                    - location: Location/port.
+                    - min_order_quantity_case: Minimum order quantity in cases.
+                    - port: Port of loading/destination if applicable.
+                    - lead_time: Lead time or availability.
+                    - supplier_name: (leave as "Not Found").
+                    - supplier_reference: Supplier offer reference.
+                    - supplier_country: Supplier's country.
+                    - offer_date: (leave as "Not Found").
+                    - valid_until: Offer validity date.
+                    - date_received: (leave as "Not Found").
+                    - source_channel: (leave as "Not Found").
+                    - source_filename: (leave as "Not Found").
+                    - source_message_id: (leave as "Not Found").
+                    - confidence_score: (leave 0.0)
+                    - error_flags: (leave empty array [])
+                    - needs_manual_review: (leave false)
+                    - best_before_date: Best before date (BBD)
+                    - label_language: Label language
+                    - ean_code: EAN product barcode
+                    - gift_box: Indicates if includes gift box (GBX)
+                    - refillable_status: REF/NRF
+                    - custom_status: Customs status: T1 or T2
+                    - moq_cases: Minimum order quantity stated in the offer.
+
+                    CRITICAL RULES FOR MISSING VALUES:
+                    1. If a field is NOT explicitly stated in the data, return "Not Found". Do NOT invent or hallucinate values.
+                    2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
+                    3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
+                    4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
+                    5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
+                    6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
+                    7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
+                    8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
+                    9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
+                    10. Never hallucinate quantities. If you're unsure, use "Not Found".
+
+                    MAPPING FROM EXCEL DATA:
+                    - Ensure you capture the full product name and brand.
+                    - If a row is clearly a product offer, extract it.
+                    - If a row is just a subtotal or header, skip it.
+                    - If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
+                    - NEVER return empty string "" for missing values, always use "Not Found".
+                    - DO NOT use null for any field - always use "Not Found" for missing values.
+
+                    PRICE INTERPRETATION:
+                    - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
+                    - "11,40eur/btl" → price_per_unit: 11.40
+                    - "32,50eur/cs" → price_per_case: 32.50
+
+                    QUANTITY EXTRACTION:
+                    - "960 cs" → quantity_case: 960
+                    - "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
+                    - "1932cs" → quantity_case: 1932
+                    - If quantity not specified, return "Not Found". Do NOT default to 0.
+                    - IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
+                    - quantity_case is the total number of cases offered, not the packaging configuration.
+                    - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
+
+                    ALCOHOL PERCENT - CRITICAL INSTRUCTION:
+                    - Extract the alcohol percentage exactly as it appears in the source text.
+                    - If the text shows "40%" → output alcohol_percent: 40
+                    - If the text shows "5%" → output alcohol_percent: 5
+                    - If the text shows "17%" → output alcohol_percent: 17
+                    - If the text shows "40" (without % sign) → output alcohol_percent: 40
+                    - If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
+                    - If the text shows "40.0" → output alcohol_percent: 40.0
+                    - NEVER perform any mathematical conversion or multiplication on the alcohol value.
+                    - NEVER change 0.4 to 40 - keep it exactly as 0.4.
+                    - If alcohol percentage is not found in the text, return "Not Found".
+                    - Do NOT default to 0 when alcohol percentage is missing.
+
+                    CASES_PER_PALLET - CRITICAL RULE:
+                    - Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
+                    - Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
+                    - If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
+                    - If not explicitly stated, cases_per_pallet must be "Not Found".
+                    - If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
+
+                    QUANTITY_CASE - CRITICAL RULE:
+                    - Only populate quantity_case if the total number of cases is EXPLICITLY stated.
+                    - Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
+                    - Do NOT derive quantity_case from packaging information like "12x750ml".
+                    - "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
+                    - If quantity_case is not explicitly stated, it must be "Not Found".
+                    - If quantity_case = 0, that means "Not Found" - treat as "Not Found".
+
+                    SUPPLIER NAME EXTRACTION:
+                    - Attempt to extract in this exact priority:
+                      1. Extract from file content itself.
+                      2. Extract from email body (e.g., "Offer from MILANAKO company").
+                      3. Extract from forwarded email signature block.
+                    - If none found in those places, return "Not Found". DO NOT default to the email sender.
+
+                    INCOTERM & LOCATION:
+                    - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
+                    - If no incoterm or location found, return "Not Found".
+
+                    DATE FIELDS:
+                    - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
+                    - "BBD 03.06.2026" → best_before_date: "2026-06-03"
+                    - "fresh" → best_before_date: "fresh"
+                    - These are NOT lead_time
+
+                    CUSTOM STATUS OR STATUS:
+                    - "T1" → custom_status: "T1"
+                    - "T2" → custom_status: "T2"
+
+                    PACKAGING_RAW:
+                    - "cans" → packaging_raw: "can"
+                    - "btls" or "bottle" → packaging_raw: "bottle"
+
+                    LABEL LANGUAGE:
+                    - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
+                    - "UK text" → label_language: "EN"
+                    - "SA label" → label_language: "multiple" 
+                    - "multi text" → label_language: "multiple"
+                    - If not mentioned, return "Not Found".
+
+                    REMEMBER: 
+                    - When in doubt, use "Not Found". 
+                    - Never invent numbers. 
+                    - Only extract what is explicitly stated. 
+                    - If a value is 0, that means "Not Found" - treat as "Not Found".
+                    - Use "Not Found" for ALL missing fields - both strings AND numbers.
+
+                    RETURN FORMAT:
+                    {{
+                      "products": [
+                        {{"product_name": "...", "product_key": "...", ...}}
+                      ]
+                    }}
+                    """
+
+                    logger.debug(f"Batch text length: {len(batch_text)}")
+
                     try:
+                        logger.info(f"Calling OpenAI API for batch {batch_start // batch_size + 1}...")
                         response = await client.chat.completions.create(
                             model="gpt-4o",
                             messages=[
                                 {
                                     "role": "system",
-                                    "content": (
-                                        MASTER_SYSTEM_PROMPT
-                                        + "\n\nNOTE: Skip blank rows and section header rows "
-                                        "silently — it is acceptable to return fewer products "
-                                        "than input rows when some rows are headers or blank."
-                                    )
+                                    "content": f"You are a professional data extraction expert. You extract commercial alcohol product data from Excel. Return COMPLETE JSON with 'products' array containing EXACTLY {len(batch_df)} products. NEVER skip rows. Create a product for every row even if data is missing, using logical defaults."
                                 },
-                                {
-                                    "role": "user",
-                                    "content": _build_excel_user_prompt(
-                                        data_rows, batch_start, batch_end,
-                                        total_rows, global_context
-                                    )
-                                }
+                                {"role": "user", "content": batch_text}
                             ],
                             response_format={"type": "json_object"},
                             temperature=0.0,
@@ -790,83 +542,175 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                         )
 
                         content = response.choices[0].message.content
-                        logger.info(f"Batch response length: {len(content)}")
+                        logger.info(f"Batch {batch_start // batch_size + 1} OpenAI response length: {len(content)}")
 
-                        # JSON repair if truncated
                         if not content.strip().endswith('}'):
-                            logger.warning("JSON incomplete, attempting repair")
+                            logger.warning(
+                                f"Batch {batch_start // batch_size + 1}: JSON appears incomplete, attempting repair")
                             json_start = content.find('{')
                             if json_start != -1:
-                                open_b = close_b = 0
-                                for i, ch in enumerate(content[json_start:]):
-                                    if ch == '{':
-                                        open_b += 1
-                                    elif ch == '}':
-                                        close_b += 1
-                                        if close_b == open_b:
+                                open_braces = 0
+                                close_braces = 0
+                                for i, char in enumerate(content[json_start:]):
+                                    if char == '{':
+                                        open_braces += 1
+                                    elif char == '}':
+                                        close_braces += 1
+                                        if close_braces == open_braces:
                                             content = content[json_start:json_start + i + 1]
+                                            logger.info(
+                                                f"Batch {batch_start // batch_size + 1}: Repaired JSON, new length: {len(content)}")
                                             break
 
-                        result = json.loads(content)
-
-                        if isinstance(result, dict) and 'products' in result:
-                            batch_products = result['products']
-                        elif isinstance(result, list):
-                            batch_products = result
-                        else:
-                            batch_products = []
-
-                        cleaned_batch = [clean_product_data(p) for p in batch_products]
-                        all_extracted_products.extend(cleaned_batch)
-                        processed_row_count += len(batch_df)
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON error batch {batch_start // batch_size + 1}: {e}")
                         try:
-                            matches = re.findall(r'\{.*\}', content, re.DOTALL)
-                            for match in matches:
-                                try:
-                                    salvaged = json.loads(match)
-                                    if isinstance(salvaged, dict) and 'products' in salvaged:
-                                        cleaned_batch = [
-                                            clean_product_data(p)
-                                            for p in salvaged['products']
-                                        ]
-                                        all_extracted_products.extend(cleaned_batch)
-                                        logger.warning(
-                                            f"Salvaged {len(cleaned_batch)} products via regex")
-                                        break
-                                except Exception:
-                                    continue
-                        except Exception as se:
-                            logger.error(f"Salvage failed: {se}")
-                        processed_row_count += len(batch_df)
+                            result = json.loads(content)
+                            logger.info(f"Batch {batch_start // batch_size + 1} JSON parsed successfully")
+
+                            if isinstance(result, dict) and 'products' in result:
+                                batch_products = result['products']
+                                logger.info(
+                                    f"Batch {batch_start // batch_size + 1} extracted {len(batch_products)} products from 'products' key")
+
+                                if len(batch_products) != len(batch_df):
+                                    logger.warning(
+                                        f"Batch {batch_start // batch_size + 1}: Expected {len(batch_df)} products but got {len(batch_products)}. Attempting to salvage...")
+                                    if len(batch_products) < len(batch_df):
+                                        missing_count = len(batch_df) - len(batch_products)
+                                        for i in range(missing_count):
+                                            default_product = clean_product_data({})
+                                            default_product[
+                                                'product_name'] = f"Row {batch_start + len(batch_products) + i + 1}"
+                                            batch_products.append(default_product)
+
+                                cleaned_batch_products = []
+                                for product in batch_products:
+                                    cleaned_product = clean_product_data(product)
+                                    cleaned_batch_products.append(cleaned_product)
+
+                                all_extracted_products.extend(cleaned_batch_products)
+                                processed_row_count += len(batch_df)
+
+                                if cleaned_batch_products:
+                                    logger.debug(
+                                        f"First product in batch: {json.dumps(cleaned_batch_products[0], indent=2)[:300]}...")
+                            elif isinstance(result, list):
+                                logger.info(
+                                    f"Batch {batch_start // batch_size + 1}: Found direct list with {len(result)} items")
+                                if len(result) != len(batch_df):
+                                    logger.warning(
+                                        f"Batch {batch_start // batch_size + 1}: List count mismatch. Expected {len(batch_df)}, got {len(result)}")
+                                    if len(result) < len(batch_df):
+                                        missing_count = len(batch_df) - len(result)
+                                        for i in range(missing_count):
+                                            default_product = clean_product_data({})
+                                            default_product['product_name'] = f"Row {batch_start + len(result) + i + 1}"
+                                            result.append(default_product)
+
+                                cleaned_batch_products = []
+                                for product in result:
+                                    cleaned_product = clean_product_data(product)
+                                    cleaned_batch_products.append(cleaned_product)
+                                all_extracted_products.extend(cleaned_batch_products)
+                                processed_row_count += len(batch_df)
+                            else:
+                                logger.warning(
+                                    f"Batch {batch_start // batch_size + 1}: Unexpected format, creating default products")
+                                for i in range(len(batch_df)):
+                                    default_product = clean_product_data({})
+                                    default_product['product_name'] = f"Row {batch_start + i + 1}"
+                                    all_extracted_products.append(default_product)
+                                processed_row_count += len(batch_df)
+
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON parse error in batch {batch_start // batch_size + 1}: {e}")
+                            logger.error(
+                                f"Batch {batch_start // batch_size + 1} raw response (first 500 chars): {content[:500]}")
+                            logger.error(
+                                f"Batch {batch_start // batch_size + 1} raw response (last 500 chars): {content[-500:]}")
+
+                            try:
+                                import re
+                                json_pattern = r'\{.*\}'
+                                matches = re.findall(json_pattern, content, re.DOTALL)
+                                if matches:
+                                    for match in matches:
+                                        try:
+                                            result = json.loads(match)
+                                            if isinstance(result, dict) and 'products' in result:
+                                                batch_products = result['products']
+                                                if isinstance(batch_products, list):
+                                                    if len(batch_products) < len(batch_df):
+                                                        missing_count = len(batch_df) - len(batch_products)
+                                                        for i in range(missing_count):
+                                                            default_product = clean_product_data({})
+                                                            default_product[
+                                                                'product_name'] = f"Row {batch_start + len(batch_products) + i + 1}"
+                                                            batch_products.append(default_product)
+
+                                                    cleaned_batch_products = []
+                                                    for product in batch_products:
+                                                        cleaned_product = clean_product_data(product)
+                                                        cleaned_batch_products.append(cleaned_product)
+                                                    all_extracted_products.extend(cleaned_batch_products)
+                                                    processed_row_count += len(batch_df)
+                                                    logger.warning(
+                                                        f"Batch {batch_start // batch_size + 1}: Salvaged {len(cleaned_batch_products)} products from regex")
+                                                    break
+                                        except:
+                                            continue
+                            except Exception as salvage_error:
+                                logger.error(f"Failed to salvage JSON: {salvage_error}")
+                                for i in range(len(batch_df)):
+                                    default_product = clean_product_data({})
+                                    default_product['product_name'] = f"Row {batch_start + i + 1}"
+                                    all_extracted_products.append(default_product)
+                                processed_row_count += len(batch_df)
 
                     except Exception as e:
-                        logger.error(f"Batch error: {e}")
+                        logger.error(f"Error extracting batch {batch_start // batch_size + 1}: {e}")
+                        for i in range(len(batch_df)):
+                            default_product = clean_product_data({})
+                            default_product['product_name'] = f"Row {batch_start + i + 1}"
+                            all_extracted_products.append(default_product)
                         processed_row_count += len(batch_df)
 
-                logger.info(
-                    f"Extracted {len(all_extracted_products)} products "
-                    f"from {processed_row_count} rows")
+                logger.info(f"Total products extracted from all batches: {len(all_extracted_products)}")
+                logger.info(f"Total rows processed: {processed_row_count} of {total_rows}")
+
+                if len(all_extracted_products) != total_rows:
+                    logger.warning(
+                        f"Product count mismatch! Excel has {total_rows} rows but extracted {len(all_extracted_products)} products")
+                    if len(all_extracted_products) < total_rows:
+                        missing_count = total_rows - len(all_extracted_products)
+                        logger.warning(f"Adding {missing_count} default products to match row count")
+                        for i in range(missing_count):
+                            default_product = clean_product_data({})
+                            default_product['product_name'] = f"Missing Row {len(all_extracted_products) + i + 1}"
+                            all_extracted_products.append(default_product)
 
                 if all_extracted_products:
-                    logger.info("Converting prices to EUR for Excel products...")
-                    for product in all_extracted_products:
-                        currency = product.get('currency', "")
-                        if currency in ["", None, "EUR"]:
-                            product['price_per_unit_eur'] = product.get('price_per_unit')
-                            product['price_per_case_eur'] = product.get('price_per_case')
-                            continue
-                        exchange_rate = await get_exchange_rate_to_eur(currency)
-                        if product.get('price_per_unit') not in [None, "", 0]:
-                            product['price_per_unit_eur'] = convert_price_to_eur(
-                                product['price_per_unit'], currency, exchange_rate)
-                        if product.get('price_per_case') not in [None, "", 0]:
-                            product['price_per_case_eur'] = convert_price_to_eur(
-                                product['price_per_case'], currency, exchange_rate)
+                    logger.debug(
+                        f"Sample extracted products (first 2): {json.dumps(all_extracted_products[:2], indent=2)}")
+                    logger.info(f"Total extracted products after fixes: {len(all_extracted_products)}")
+                else:
+                    logger.warning("No products extracted from any batch, trying fallback...")
+                    simplified_rows = []
+                    for i in range(min(10, len(df))):
+                        row = df.iloc[i]
+                        row_dict = {}
+                        for col in df.columns:
+                            value = row[col]
+                            row_dict[col] = str(value) if not pd.isna(value) else ""
+                        simplified_rows.append(row_dict)
 
-                    return {
+                    text_content = f"Excel with {total_rows} rows. Sample data:\n{json.dumps(simplified_rows, indent=2)}"
+                    logger.info(f"Fallback text content length: {len(text_content)}")
+                    fallback_result = await extract_offer(text_content)
+                    logger.info(f"Fallback extraction result type: {type(fallback_result)}")
+                    return fallback_result
+
+                if all_extracted_products:
+                    result = {
                         'products': all_extracted_products,
                         'total_products': len(all_extracted_products),
                         'file_type': 'excel',
@@ -874,80 +718,51 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                         'batches_processed': (total_rows + batch_size - 1) // batch_size,
                         'original_rows': total_rows
                     }
+                    logger.info(f"extract_from_file completed successfully with {len(all_extracted_products)} products")
+                    return result
                 else:
-                    logger.warning("No products extracted, trying text fallback...")
-                    simplified_rows = []
-                    for i in range(min(10, len(df))):
-                        row = df.iloc[i]
-                        row_dict = {
-                            str(col): ("" if pd.isna(row[col]) else str(row[col]))
-                            for col in df.columns
-                        }
-                        simplified_rows.append(row_dict)
-                    text_content = (
-                        f"Excel with {total_rows} rows. Sample:\n"
-                        f"{json.dumps(simplified_rows, indent=2)}"
-                    )
-                    fallback = await extract_offer(text_content)
-                    if isinstance(fallback, dict) and 'products' in fallback:
-                        for product in fallback['products']:
-                            if product.get('currency') not in ["", None, "EUR"]:
-                                er = await get_exchange_rate_to_eur(product.get('currency'))
-                                if product.get('price_per_unit') not in [None, "", 0]:
-                                    product['price_per_unit_eur'] = convert_price_to_eur(
-                                        product['price_per_unit'], product.get('currency'), er)
-                                if product.get('price_per_case') not in [None, "", 0]:
-                                    product['price_per_case_eur'] = convert_price_to_eur(
-                                        product['price_per_case'], product.get('currency'), er)
-                    return fallback
+                    return {"error": "No products could be extracted from the Excel file"}
 
             except Exception as e:
-                logger.error(f"Excel error: {e}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Error reading Excel file: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                text_content = f"Excel file - error reading: {str(e)}"
                 return {"error": f"Excel read error: {str(e)}"}
 
-        # ── PDF ────────────────────────────────────────────────────────────
         elif content_type == 'application/pdf':
             logger.info("Processing PDF file...")
             try:
                 import PyPDF2
-                with open(file_path, 'rb') as f:
-                    reader = PyPDF2.PdfReader(f)
-                    text_content = "".join(page.extract_text() for page in reader.pages)
-                logger.info(f"PDF text length: {len(text_content)}")
+                with open(file_path, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    text_content = ""
+                    for page in pdf_reader.pages:
+                        text_content += page.extract_text()
+                logger.info(f"PDF extracted, text length: {len(text_content)}")
             except ImportError:
+                logger.error("PyPDF2 not installed for PDF processing")
+                text_content = "PDF processing requires PyPDF2 library"
                 return {"error": "PyPDF2 not installed"}
             except Exception as e:
-                logger.error(f"PDF error: {e}")
+                logger.error(f"Error reading PDF file: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                text_content = f"PDF file - error reading: {str(e)}"
                 return {"error": f"PDF read error: {str(e)}"}
 
-        # ── IMAGE ──────────────────────────────────────────────────────────
         elif 'image' in content_type:
             logger.info("Processing image file...")
             try:
-                with open(file_path, "rb") as f:
-                    base64_image = base64.b64encode(f.read()).decode('utf-8')
+                with open(file_path, "rb") as image_file:
+                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
                 response = await client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
-                        {"role": "system", "content": MASTER_SYSTEM_PROMPT},
                         {
                             "role": "user",
                             "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "Extract all commercial alcohol/beverage offers from this image.\n"
-                                        "Return ONLY a JSON object {'products': [...]}.\n\n"
-                                        "Critical reminders:\n"
-                                        "1. alcohol_percent: ABV < 1.0 → multiply by 100 → '40%'.\n"
-                                        "2. refillable_status: CAN/BOTTLE → bottle_or_can_type only. "
-                                        "NEVER output NRF unless explicitly written.\n"
-                                        "3. custom_status: extract T1 or T2 from any column/text.\n"
-                                        "4. Blank fields → '' or null. Never 'Not Found' or 0."
-                                    )
-                                },
+                                {"type": "text",
+                                 "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema."},
                                 {
                                     "type": "image_url",
                                     "image_url": f"data:{content_type};base64,{base64_image}",
@@ -957,244 +772,147 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     ],
                     max_tokens=4096,
                 )
-                logger.info("Image processed")
-                raw = response.choices[0].message.content
-                result = await extract_offer(raw)
-                if isinstance(result, dict) and 'products' in result:
-                    for product in result['products']:
-                        if product.get('currency') not in ["", None, "EUR"]:
-                            er = await get_exchange_rate_to_eur(product.get('currency'))
-                            if product.get('price_per_unit') not in [None, "", 0]:
-                                product['price_per_unit_eur'] = convert_price_to_eur(
-                                    product['price_per_unit'], product.get('currency'), er)
-                            if product.get('price_per_case') not in [None, "", 0]:
-                                product['price_per_case_eur'] = convert_price_to_eur(
-                                    product['price_per_case'], product.get('currency'), er)
-                return result
+                logger.info("Image processed with OpenAI")
+                return await extract_offer(response.choices[0].message.content)
 
             except Exception as e:
-                logger.error(f"Image error: {e}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Error extracting from image: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 return {"error": f"Image processing error: {str(e)}"}
 
-        # ── TEXT / OTHER ───────────────────────────────────────────────────
         else:
-            logger.info(f"Processing text file, content_type: {content_type}")
+            logger.info(f"Processing text file with content_type: {content_type}")
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text_content = f.read()
-            except UnicodeDecodeError:
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    text_content = file.read()
+                logger.info(f"Text file read, length: {len(text_content)}")
+            except:
                 try:
-                    with open(file_path, 'r', encoding='latin-1') as f:
-                        text_content = f.read()
+                    with open(file_path, 'r', encoding='latin-1') as file:
+                        text_content = file.read()
+                    logger.info(f"Text file read with latin-1 encoding, length: {len(text_content)}")
                 except Exception as e:
+                    logger.error(f"Error reading text file: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                     return {"error": f"Text file read error: {str(e)}"}
-            except Exception as e:
-                return {"error": f"Text file read error: {str(e)}"}
 
         if text_content:
-            return await extract_offer(text_content)
+            logger.info(f"Calling extract_offer with text content length: {len(text_content)}")
+            result = await extract_offer(text_content)
+            logger.info(f"extract_offer returned result type: {type(result)}")
+            return result
         else:
+            logger.warning("No text content extracted from file")
             return {"error": "No content extracted from file"}
 
     except Exception as e:
-        logger.error(f"extract_from_file error: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error extracting from file: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return {"error": f"General extraction error: {str(e)}"}
 
 
-# =============================================================================
-# clean_product_data
-# Lightweight schema sanitiser only — NO business logic transformation.
-# The AI outputs correct values. This function only:
-#   1. Ensures all schema fields exist
-#   2. Casts numeric fields to float/None
-#   3. Removes sentinel strings → proper blanks
-#   4. Safety-net: decimal ABV → "XX%"
-#   5. Safety-net: refillable_status whitelist
-#   6. Safety-net: currency "EURO" → "EUR"
-# =============================================================================
 def clean_product_data(product: dict) -> dict:
-    """Lightweight schema enforcer. No business logic — AI handles that."""
-
-    schema_defaults = {
-        'uid': "",
-        'product_key': "",
-        'processing_version': "",
-        'brand': "",
-        'product_name': "",
-        'product_reference': "",
-        'category': "",
-        'sub_category': "",
-        'origin_country': "",
-        'vintage': "",
-        'alcohol_percent': "",
-        'packaging': "",
-        'unit_volume_ml': None,
-        'units_per_case': None,
-        'cases_per_pallet': None,
-        'quantity_case': None,
-        'bottle_or_can_type': "",
-        'price_per_unit': None,
-        'price_per_case': None,
-        'currency': "",
-        'price_per_unit_eur': None,
-        'price_per_case_eur': None,
-        'incoterm': "",
-        'location': "",
-        'min_order_quantity_case': None,
-        'port': "",
-        'lead_time': "",
-        'supplier_name': "",
-        'supplier_reference': "",
-        'supplier_country': "",
-        'offer_date': "",
-        'valid_until': "",
-        'date_received': "",
-        'source_channel': "",
-        'source_filename': "",
-        'source_message_id': "",
+    """Clean up product data to ensure it matches schema exactly"""
+    schema_fields = {
+        'uid': "Not Found",
+        'product_key': "Not Found",
+        'processing_version': "Not Found",
+        'brand': "Not Found",
+        'product_name': "Not Found",
+        'product_reference': "Not Found",
+        'category': "Not Found",
+        'sub_category': "Not Found",
+        'origin_country': "Not Found",
+        'vintage': "Not Found",
+        'alcohol_percent': None,  # Changed from "Not Found" to None for numeric fields
+        'packaging': "Not Found",
+        'unit_volume_ml': None,  # Changed from "Not Found" to None for numeric fields
+        'units_per_case': None,  # Changed from "Not Found" to None for numeric fields
+        'cases_per_pallet': None,  # Changed from "Not Found" to None for numeric fields
+        'quantity_case': None,  # Changed from "Not Found" to None for numeric fields
+        'bottle_or_can_type': "Not Found",
+        'price_per_unit': None,  # Changed from "Not Found" to None for numeric fields
+        'price_per_case': None,  # Changed from "Not Found" to None for numeric fields
+        'currency': "EUR",
+        'price_per_unit_eur': None,  # Changed from "Not Found" to None for numeric fields
+        'price_per_case_eur': None,  # Changed from "Not Found" to None for numeric fields
+        'incoterm': "Not Found",
+        'location': "Not Found",
+        'min_order_quantity_case': None,  # Changed from "Not Found" to None for numeric fields
+        'port': "Not Found",
+        'lead_time': "Not Found",
+        'supplier_name': "Not Found",
+        'supplier_reference': "Not Found",
+        'supplier_country': "Not Found",
+        'offer_date': "Not Found",
+        'valid_until': "Not Found",
+        'date_received': "Not Found",
+        'source_channel': "Not Found",
+        'source_filename': "Not Found",
+        'source_message_id': "Not Found",
         'confidence_score': 0.0,
         'error_flags': [],
         'needs_manual_review': False,
-        'best_before_date': "",
-        'label_language': "",
-        'ean_code': "",
-        'gift_box': "",
-        'refillable_status': "",
-        'custom_status': "",
-        'moq_cases': None,
+        'best_before_date': "Not Found",
+        'label_language': "Not Found",
+        'ean_code': "Not Found",
+        'gift_box': "Not Found",
+        'refillable_status': "NRF",
+        'custom_status': "Not Found",
+        'moq_cases': None  # Changed from "Not Found" to None for numeric fields
     }
 
-    SENTINELS = {
-        None, "Not Found", "not found", "NOT FOUND", "null", "NULL",
-        "N/A", "n/a", "na", "NA", "none", "None", "NONE", ""
-    }
+    cleaned_product = {}
 
-    NUMERIC_FIELDS = {
-        'unit_volume_ml', 'units_per_case', 'cases_per_pallet', 'quantity_case',
-        'price_per_unit', 'price_per_case', 'price_per_unit_eur', 'price_per_case_eur',
-        'min_order_quantity_case', 'moq_cases',
-    }
+    for field, default_value in schema_fields.items():
+        if field in product:
+            value = product[field]
 
-    NUMERIC_NEVER_ZERO = {
-        'unit_volume_ml', 'units_per_case', 'cases_per_pallet', 'quantity_case',
-        'min_order_quantity_case', 'moq_cases',
-    }
-
-    cleaned = {}
-
-    for field, default in schema_defaults.items():
-        raw = product.get(field, default)
-
-        # ── Numeric fields ────────────────────────────────────────────────
-        if field in NUMERIC_FIELDS:
-            if raw in SENTINELS or raw == 0 or raw == "0":
-                cleaned[field] = None
+            # Convert None, empty strings, null, and 0 to appropriate default
+            if value in [None, "Not Found", "", "null", 0, "0"]:
+                cleaned_product[field] = default_value
             else:
-                try:
-                    fval = float(str(raw).replace(',', '.'))
-                    if field in NUMERIC_NEVER_ZERO and fval == 0:
-                        cleaned[field] = None
-                    else:
-                        cleaned[field] = fval
-                except (ValueError, TypeError):
-                    cleaned[field] = None
+                numeric_keys = [
+                    'unit_volume_ml', 'units_per_case', 'cases_per_pallet',
+                    'quantity_case', 'price_per_unit', 'price_per_unit_eur',
+                    'price_per_case', 'price_per_case_eur', 'alcohol_percent', 'moq_cases'
+                ]
 
-        # ── alcohol_percent — preserve AI output + safety-net conversion ──
-        elif field == 'alcohol_percent':
-            if raw in SENTINELS or raw == 0 or raw == "0" or raw == "0%":
-                cleaned[field] = ""
-            elif isinstance(raw, str) and raw.strip().endswith('%'):
-                # AI output correct format — keep as-is
-                cleaned[field] = raw.strip()
-            elif isinstance(raw, (int, float)):
-                fval = float(raw)
-                if fval == 0:
-                    cleaned[field] = ""
-                elif fval < 1.0:
-                    # Safety net: decimal fraction slipped through
-                    pct = round(fval * 100, 2)
-                    cleaned[field] = f"{int(pct)}%" if pct == int(pct) else f"{pct}%"
-                elif fval.is_integer():
-                    cleaned[field] = f"{int(fval)}%"
-                else:
-                    cleaned[field] = f"{fval}%"
-            elif isinstance(raw, str):
-                s = raw.strip()
-                if not s:
-                    cleaned[field] = ""
-                else:
+                if field in numeric_keys:
                     try:
-                        fval = float(s.replace('%', '').replace(',', '.'))
-                        if fval == 0:
-                            cleaned[field] = ""
-                        elif fval < 1.0:
-                            pct = round(fval * 100, 2)
-                            cleaned[field] = f"{int(pct)}%" if pct == int(pct) else f"{pct}%"
-                        elif fval.is_integer():
-                            cleaned[field] = f"{int(fval)}%"
+                        # For alcohol_percent, preserve the exact value without any conversion
+                        if field == 'alcohol_percent':
+                            cleaned_product[field] = float(value)
                         else:
-                            cleaned[field] = f"{fval}%"
+                            cleaned_product[field] = float(value)
                     except (ValueError, TypeError):
-                        cleaned[field] = ""
-            else:
-                cleaned[field] = ""
-
-        # ── refillable_status — strict whitelist safety net ───────────────
-        elif field == 'refillable_status':
-            if raw in SENTINELS:
-                cleaned[field] = ""
-            else:
-                val = str(raw).strip().upper()
-                if val in ("RF", "REF", "REFILLABLE"):
-                    cleaned[field] = "REF"
-                elif val in ("NRF", "NON-REFILLABLE", "NON REFILLABLE"):
-                    cleaned[field] = "NRF"
+                        cleaned_product[field] = None  # Use None for failed conversions
+                elif isinstance(default_value, list):
+                    cleaned_product[field] = value if isinstance(value, list) else []
+                elif isinstance(default_value, bool):
+                    cleaned_product[field] = bool(value)
                 else:
-                    # CAN, BOTTLE, or anything else → not a refillable_status value
-                    cleaned[field] = ""
-
-        # ── currency — normalise EURO → EUR safety net ────────────────────
-        elif field == 'currency':
-            if raw in SENTINELS:
-                cleaned[field] = ""
-            else:
-                val = str(raw).strip().upper()
-                if val in ("EURO", "EUROS", "€"):
-                    cleaned[field] = "EUR"
-                else:
-                    cleaned[field] = val
-
-        # ── List fields ───────────────────────────────────────────────────
-        elif isinstance(default, list):
-            cleaned[field] = raw if isinstance(raw, list) else []
-
-        # ── Boolean fields ────────────────────────────────────────────────
-        elif isinstance(default, bool):
-            cleaned[field] = bool(raw) if raw not in SENTINELS else False
-
-        # ── Float (confidence_score) ──────────────────────────────────────
-        elif isinstance(default, float):
-            try:
-                cleaned[field] = float(raw)
-            except (ValueError, TypeError):
-                cleaned[field] = default
-
-        # ── All other string fields ───────────────────────────────────────
+                    cleaned_product[field] = str(value) if value is not None else default_value
         else:
-            cleaned[field] = "" if raw in SENTINELS else str(raw)
+            cleaned_product[field] = default_value
 
-    # Auto-generate product_key if missing
-    if not cleaned.get('product_key') and cleaned.get('product_name'):
-        cleaned['product_key'] = (
-            str(cleaned['product_name'])
-            .replace(' ', '_').replace('/', '_')
-            .replace('&', '_').replace('.', '').replace("'", "")
-            .upper()
-        )
+    if cleaned_product['product_key'] in ["Not Found"] and cleaned_product['product_name'] not in ["Not Found"]:
+        product_key = str(cleaned_product['product_name']).replace(' ', '_').replace('/', '_').replace('&',
+                                                                                                       '_').replace('.',
+                                                                                                                    '').upper()
+        cleaned_product['product_key'] = product_key
 
-    return cleaned
+    # Convert any 0 values to None for numeric fields that shouldn't have 0 as a valid value
+    numeric_fields_never_zero = [
+        'cases_per_pallet', 'quantity_case', 'moq_cases',
+        'alcohol_percent', 'unit_volume_ml', 'units_per_case'
+    ]
+
+    for field in numeric_fields_never_zero:
+        if field in cleaned_product and cleaned_product[field] == 0:
+            cleaned_product[field] = None
+
+    return cleaned_product
 
 
 def parse_buffer_data(buffer_data: dict) -> bytes:
@@ -1219,8 +937,7 @@ def parse_buffer_data(buffer_data: dict) -> bytes:
                 logger.debug(f"Parsed list data, length: {len(data_bytes)} bytes")
                 return data_bytes
             else:
-                logger.warning(
-                    f"Unexpected data type in buffer_data['data']: {type(buffer_data['data'])}")
+                logger.warning(f"Unexpected data type in buffer_data['data']: {type(buffer_data['data'])}")
                 return b''
         except Exception as e:
             logger.error(f"Error parsing buffer_data with 'data' key: {e}")
@@ -1235,4 +952,5 @@ def parse_buffer_data(buffer_data: dict) -> bytes:
             return b''
     else:
         logger.warning(f"Unexpected buffer_data type: {type(buffer_data)}")
+        logger.debug(f"buffer_data value: {buffer_data}")
         return b''
