@@ -108,6 +108,28 @@ async def extract_offer(text: str) -> dict:
         5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
         6. DO NOT use null for any field - always use "Not Found" for missing values.
         7. Use AI to intelligently match values to fields - if something in email matches a field, extract it
+        
+        ──────────────────────────────────────────────────────────────────
+        A8. supplier_name — COMPANY NAME ONLY -  OVERRIDE RULE
+        ──────────────────────────────────────────────────────────────────
+        Extract from (priority order):
+          1. Official company name in file header / footer
+          2. Email signature company name
+          3. "Offer from <Company>" in body
+          4. Sheet/file title if it contains a company name
+        NEVER use person names, sales desk names, or email usernames.
+        If none found → "".
+        
+        ──────────────────────────────────────────────────────────────────
+        A9. supplier_reference — OVERRIDE RULE  ⚠️
+        ──────────────────────────────────────────────────────────────────
+        Scan EVERY column and piece of text. If found, MUST write to supplier_reference.
+        
+        Column names to scan:
+          "P.Code", "P Code", "Ref", "Reference", "Ref No", "Supplier Ref",
+          "Offer Ref", "Offer No", "SKU", "Item Code", "Product Code",
+          "Stock Code", "Art No", "Article", "Code", "Barcode"
+
 
         PRICE INTERPRETATION:
         - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
