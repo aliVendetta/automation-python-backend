@@ -13,20 +13,28 @@ from core.webhook_client import send_consolidated_webhook
 
 logger = logging.getLogger(__name__)
 
+
 def is_valid_offer(offer_dict: dict) -> bool:
     """Strict validation for extracted offers"""
     if not offer_dict:
         return False
-    
+
     name = offer_dict.get('product_name')
     if not name or name in ["Not Found", "Unknown", "Row", ""]:
         return False
-        
-    if name.lower().startswith('row '): # Skip generic placeholders
+
+    if name.lower().startswith('row '):  # Skip generic placeholders
         return False
-        
+
     # Check for minimal commercial data
-    if offer_dict.get('price_per_unit') == 0 and offer_dict.get('price_per_case') == 0:
+    # FIX BUG 5: openai_client now returns None (not 0) for missing prices.
+    # None == 0 is always False in Python, so the original check would silently
+    # pass products with no price. Check for both None and 0.
+    price_unit = offer_dict.get('price_per_unit')
+    price_case = offer_dict.get('price_per_case')
+    unit_is_empty = price_unit is None or price_unit == 0
+    case_is_empty = price_case is None or price_case == 0
+    if unit_is_empty and case_is_empty:
         # If no price is found, it's often a false positive or truncated data
         logger.debug(f"Offer {name} rejected: No price data found.")
         return False
@@ -34,12 +42,27 @@ def is_valid_offer(offer_dict: dict) -> bool:
     return True
 
 
+def _safe_float(value, default=None):
+    """Safely convert a value to float, returning default if conversion fails.
+
+    FIX BUG 4: openai_client now returns None for missing numeric fields.
+    bare float(None) raises TypeError causing the whole product to be silently
+    skipped. This helper handles None, empty string, and invalid values safely.
+    """
+    if value is None or value == "" or value == "Not Found":
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
 async def process_offer(payload, job_id: str):
     try:
         uid = str(uuid.uuid4())
         extracted_data = {}
         all_products = []
-        processed_keys = set() # For deduplication
+        processed_keys = set()  # For deduplication
         valid_count = 0
         duplicate_count = 0
 
@@ -123,48 +146,61 @@ async def process_offer(payload, job_id: str):
             for idx, product_data in enumerate(all_products):
                 try:
                     merged_data = {**extracted_data, **product_data}
-                    logger.debug(f"Row {idx} raw data before cleaning: {merged_data.get('product_name')} | {merged_data.get('brand')}")
+                    logger.debug(
+                        f"Row {idx} raw data before cleaning: {merged_data.get('product_name')} | {merged_data.get('brand')}")
 
                     safe_data = {
-                        'product_name': merged_data.get('product_name') or "Not Found",
-                        'product_key': merged_data.get('product_key') or "Not Found",
-                        'brand': merged_data.get('brand') or "Not Found",
+                        'product_name': merged_data.get('product_name'),
+                        'product_key': merged_data.get('product_key'),
+                        'brand': merged_data.get('brand'),
                         'category': merged_data.get('category'),
                         'sub_category': merged_data.get('sub_category'),
-                        'packaging': merged_data.get('packaging') or "Bottle",
-                        'packaging_raw': merged_data.get('packaging_raw') or "bottle",
+                        'packaging': merged_data.get('packaging'),
+                        'packaging_raw': merged_data.get('packaging_raw'),
                         'bottle_or_can_type': merged_data.get('bottle_or_can_type'),
-                        'unit_volume_ml': float(merged_data.get('unit_volume_ml', 0) or 0),
-                        'units_per_case': float(merged_data.get('units_per_case', 0) or 0),
+                        # FIX BUG 4: use _safe_float() instead of bare float() so that
+                        # None values from openai_client don't raise TypeError and silently
+                        # skip the entire product.
+                        'unit_volume_ml': _safe_float(merged_data.get('unit_volume_ml'), 0),
+                        'units_per_case': _safe_float(merged_data.get('units_per_case'), 0),
                         'cases_per_pallet': merged_data.get('cases_per_pallet'),
                         'quantity_case': merged_data.get('quantity_case'),
                         'gift_box': merged_data.get('gift_box'),
-                        'refillable_status': merged_data.get('refillable_status') or "NRF",
-                        'currency': merged_data.get('currency') or "EUR",
-                        'price_per_unit': float(merged_data.get('price_per_unit', 0) or 0),
-                        'price_per_unit_eur': float(merged_data.get('price_per_unit_eur', 0) or 0),
-                        'price_per_case': float(merged_data.get('price_per_case', 0) or 0),
-                        'price_per_case_eur': float(merged_data.get('price_per_case_eur', 0) or 0),
-                        'fx_rate': float(merged_data.get('fx_rate', 1.0) or 1.0),
+                        'refillable_status': merged_data.get('refillable_status'),
+                        'currency': merged_data.get('currency'),
+                        'price_per_unit': _safe_float(merged_data.get('price_per_unit'), 0),
+                        'price_per_unit_eur': _safe_float(merged_data.get('price_per_unit_eur'), 0),
+                        'price_per_case': _safe_float(merged_data.get('price_per_case'), 0),
+                        'price_per_case_eur': _safe_float(merged_data.get('price_per_case_eur'), 0),
+                        'fx_rate': _safe_float(merged_data.get('fx_rate'), 1.0),
                         'fx_date': merged_data.get('fx_date'),
+                        # FIX BUG 1: alcohol_percent is now a string like "40%" from
+                        # openai_client. Keep it as a string here — do NOT put it in the
+                        # numeric_fields conversion loop below.
                         'alcohol_percent': merged_data.get('alcohol_percent'),
                         'origin_country': merged_data.get('origin_country'),
-                        'supplier_country': merged_data.get('supplier_country') or "",
-                        'incoterm': merged_data.get('incoterm') or "Not Found",
-                        'location': merged_data.get('location') or "Not Found",
-                        'lead_time': merged_data.get('lead_time') or "Not Found",
+                        'supplier_country': merged_data.get('supplier_country'),
+                        'incoterm': merged_data.get('incoterm'),
+                        'location': merged_data.get('location'),
+                        'lead_time': merged_data.get('lead_time'),
                         'moq_cases': merged_data.get('moq_cases'),
                         'valid_until': merged_data.get('valid_until'),
                         'best_before_date': merged_data.get('best_before_date'),
                         'vintage': merged_data.get('vintage'),
                         'supplier_reference': merged_data.get('supplier_reference'),
                         'ean_code': merged_data.get('ean_code'),
-                        'label_language': merged_data.get('label_language') or "EN",
+                        'label_language': merged_data.get('label_language'),
                         'product_reference': merged_data.get('product_reference'),
+                        # FIX BUG 2: custom_status was hardcoded as None. Extract it from
+                        # the merged data so T1/T2 values extracted by the AI are passed through.
+                        'custom_status': merged_data.get('custom_status'),
                     }
 
                     # Convert numeric fields
-                    numeric_fields = ['cases_per_pallet', 'quantity_case', 'moq_cases', 'alcohol_percent']
+                    # FIX BUG 1: alcohol_percent removed from this list. It is now a string
+                    # like "40%" returned by openai_client. float("40%") raises ValueError
+                    # which caused it to always be set to None. Keep it as a string.
+                    numeric_fields = ['cases_per_pallet', 'quantity_case', 'moq_cases']
                     for field in numeric_fields:
                         if safe_data[field] is not None:
                             try:
@@ -219,7 +255,9 @@ async def process_offer(payload, job_id: str):
                         confidence_score=0.95,
                         needs_manual_review=False,
                         error_flags=[],
-                        custom_status=None,
+                        # FIX BUG 2: pass extracted custom_status instead of hardcoded None.
+                        # The AI now correctly extracts T1/T2 from the STATUS column.
+                        custom_status=safe_data['custom_status'],
                         processing_version="2.0.0",
                         ean_code=safe_data['ean_code'],
                         label_language=safe_data['label_language'],
@@ -227,7 +265,7 @@ async def process_offer(payload, job_id: str):
                     )
 
                     offer_dict = offer.model_dump(mode='json')
-                    
+
                     # Validation & Deduplication
                     if is_valid_offer(offer_dict):
                         p_key = offer_dict.get('product_key', '')
@@ -270,19 +308,24 @@ async def process_offer(payload, job_id: str):
                     'packaging': extracted_data.get('packaging') or "Bottle",
                     'packaging_raw': extracted_data.get('packaging_raw') or "bottle",
                     'bottle_or_can_type': extracted_data.get('bottle_or_can_type'),
-                    'unit_volume_ml': float(extracted_data.get('unit_volume_ml', 0) or 0),
-                    'units_per_case': float(extracted_data.get('units_per_case', 0) or 0),
+                    # FIX BUG 4: use _safe_float() for all numeric fields.
+                    'unit_volume_ml': _safe_float(extracted_data.get('unit_volume_ml'), 0),
+                    'units_per_case': _safe_float(extracted_data.get('units_per_case'), 0),
                     'cases_per_pallet': extracted_data.get('cases_per_pallet'),
                     'quantity_case': extracted_data.get('quantity_case'),
                     'gift_box': extracted_data.get('gift_box'),
-                    'refillable_status': extracted_data.get('refillable_status') or "NRF",
+                    # FIX BUG 3: the original defaulted to "NRF" when refillable_status
+                    # was blank. openai_client now returns "" for absent fields.
+                    # Defaulting to "NRF" violates the business rule: never assume NRF.
+                    'refillable_status': extracted_data.get('refillable_status') or "",
                     'currency': extracted_data.get('currency') or "EUR",
-                    'price_per_unit': float(extracted_data.get('price_per_unit', 0) or 0),
-                    'price_per_unit_eur': float(extracted_data.get('price_per_unit_eur', 0) or 0),
-                    'price_per_case': float(extracted_data.get('price_per_case', 0) or 0),
-                    'price_per_case_eur': float(extracted_data.get('price_per_case_eur', 0) or 0),
-                    'fx_rate': float(extracted_data.get('fx_rate', 1.0) or 1.0),
+                    'price_per_unit': _safe_float(extracted_data.get('price_per_unit'), 0),
+                    'price_per_unit_eur': _safe_float(extracted_data.get('price_per_unit_eur'), 0),
+                    'price_per_case': _safe_float(extracted_data.get('price_per_case'), 0),
+                    'price_per_case_eur': _safe_float(extracted_data.get('price_per_case_eur'), 0),
+                    'fx_rate': _safe_float(extracted_data.get('fx_rate'), 1.0),
                     'fx_date': extracted_data.get('fx_date'),
+                    # FIX BUG 1: keep alcohol_percent as string — do not convert to float.
                     'alcohol_percent': extracted_data.get('alcohol_percent'),
                     'origin_country': extracted_data.get('origin_country'),
                     'supplier_country': extracted_data.get('supplier_country') or "",
@@ -297,10 +340,13 @@ async def process_offer(payload, job_id: str):
                     'ean_code': extracted_data.get('ean_code'),
                     'label_language': extracted_data.get('label_language') or "EN",
                     'product_reference': extracted_data.get('product_reference'),
+                    # FIX BUG 2: pass extracted custom_status instead of hardcoded None.
+                    'custom_status': extracted_data.get('custom_status'),
                 }
 
                 # Convert numeric fields
-                numeric_fields = ['cases_per_pallet', 'quantity_case', 'moq_cases', 'alcohol_percent']
+                # FIX BUG 1: alcohol_percent removed — it is a string "40%" not a number.
+                numeric_fields = ['cases_per_pallet', 'quantity_case', 'moq_cases']
                 for field in numeric_fields:
                     if safe_data[field] is not None:
                         try:
@@ -354,7 +400,8 @@ async def process_offer(payload, job_id: str):
                     confidence_score=0.95,
                     needs_manual_review=False,
                     error_flags=[],
-                    custom_status=None,
+                    # FIX BUG 2: pass extracted custom_status instead of hardcoded None.
+                    custom_status=safe_data['custom_status'],
                     processing_version="2.0.0",
                     ean_code=safe_data['ean_code'],
                     label_language=safe_data['label_language'],
