@@ -788,7 +788,9 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                                  "text": "Extract all commercial alcohol offers from this image. Return a JSON object with a 'products' array following the standard schema."},
                                 {
                                     "type": "image_url",
-                                    "image_url": f"data:{content_type};base64,{base64_image}",
+                                    "image_url": {
+                                        "url": f"data:{content_type};base64,{base64_image}"
+                                    },
                                 },
                             ],
                         }

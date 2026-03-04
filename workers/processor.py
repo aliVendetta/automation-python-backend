@@ -378,9 +378,9 @@ async def process_offer(payload, job_id: str):
                     fx_rate=safe_data['fx_rate'],
                     fx_date=safe_data['fx_date'],
                     alcohol_percent=(
-                        f"{safe_data['alcohol_percent']}%"
-                        if safe_data.get('alcohol_percent')
-                        else ""
+                        float(str(safe_data['alcohol_percent']).replace('%', '').strip())
+                        if safe_data.get('alcohol_percent') not in [None, '', 'Not Found']
+                        else None
                     ),
                     origin_country=safe_data['origin_country'],
                     supplier_country=safe_data['supplier_country'],
