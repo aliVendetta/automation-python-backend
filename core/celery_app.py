@@ -1,5 +1,6 @@
 import os
 import ssl
+import socket
 from celery import Celery
 
 broker_url = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
@@ -13,9 +14,9 @@ celery_app = Celery(
 )
 
 ssl_conf = None
-if broker_url.startswith('rediss://'):
+if broker_url.startswith("rediss://"):
     ssl_conf = {
-        'ssl_cert_reqs': ssl.CERT_NONE
+        "ssl_cert_reqs": ssl.CERT_NONE
     }
 
 celery_app.conf.update(
@@ -29,12 +30,27 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     broker_use_ssl=ssl_conf,
     redis_backend_use_ssl=ssl_conf,
-    broker_heartbeat=30,
+
+    broker_heartbeat=0,
+    broker_heartbeat_checkrate=2,
+
+    broker_transport_options={
+        "visibility_timeout": 3600,
+        "socket_keepalive": True,
+        "socket_keepalive_options": {
+            socket.TCP_KEEPIDLE: 60,
+            socket.TCP_KEEPINTVL: 10,
+            socket.TCP_KEEPCNT: 6,
+        },
+        "socket_connect_timeout": 10,
+        "socket_timeout": 30,
+        "retry_on_timeout": True,
+    },
+
+    redis_socket_keepalive=True,
+
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     worker_max_tasks_per_child=10,
-    broker_transport_options={
-        "visibility_timeout": 3600
-    },
     worker_concurrency=1,
 )
