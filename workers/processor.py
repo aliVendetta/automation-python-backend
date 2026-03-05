@@ -243,7 +243,11 @@ async def process_offer(payload, job_id: str):
                         date_received=datetime.utcnow(),
                         best_before_date=safe_data['best_before_date'],
                         vintage=safe_data['vintage'],
-                        supplier_name=payload.supplier_name,
+                        supplier_name=(
+                            safe_data['supplier_name']
+                            if safe_data.get('supplier_name') not in [None, "Not Found", ""]
+                            else payload.supplier_name
+                        ),
                         supplier_email=payload.supplier_email,
                         supplier_reference=safe_data['supplier_reference'],
                         source_channel=payload.source_channel,
@@ -254,9 +258,7 @@ async def process_offer(payload, job_id: str):
                         attachment_count=len(payload.attachments) if payload.attachments else 0,
                         confidence_score=0.95,
                         needs_manual_review=False,
-                        error_flags=[],
-                        # FIX BUG 2: pass extracted custom_status instead of hardcoded None.
-                        # The AI now correctly extracts T1/T2 from the STATUS column.
+                        error_flags=safe_data['error_flags'] if isinstance(safe_data.get('error_flags'), list) else [],
                         custom_status=safe_data['custom_status'],
                         processing_version="2.0.0",
                         ean_code=safe_data['ean_code'],

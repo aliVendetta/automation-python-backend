@@ -2,13 +2,12 @@ import os
 import json
 import base64
 import pandas as pd
-from typing import Dict, Any, List
+from typing import Dict, Any
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import logging
 import traceback
 
-# Root logging configured in entry points
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -16,15 +15,298 @@ load_dotenv()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
+SHARED_EXTRACTION_RULES = """
+SCHEMA DEFINITION - Use EXACTLY these field names and rules:
+- uid: Unique internal ID for each row (DO NOT generate - leave as "Not Found")
+- product_key: Logical ID for deduplication (brand + name + volume + packaging). UPPERCASE with underscores.
+- processing_version: Backend version used (leave as "Not Found")
+- brand: Brand or trademark of the product.
+- product_name: Commercial product name.
+- product_reference: Supplier or internal reference/SKU.
+- category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
+- sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
+- origin_country: Country of origin (ISO 2 code or full name).
+- vintage: Vintage year (for wine/champagne).
+- alcohol_percent: Alcohol percentage if applicable.
+- packaging: Full packaging description (e.g. 6x750ml).
+- unit_volume_ml: Volume per unit in milliliters (convert CL: 75CL = 750ml).
+- units_per_case: Number of units (bottles/cans) per case.
+- cases_per_pallet: Number of cases per pallet.
+- quantity_case: Number of cases offered or ordered.
+- bottle_or_can_type: Packaging type (bottle/can/other).
+- price_per_unit: Unit price.
+- price_per_case: Case price.
+- currency: Currency (EUR, USD, GBP...).
+- price_per_unit_eur: Unit price converted into EUR.
+- price_per_case_eur: Case price converted into EUR.
+- incoterm: Incoterm (FOB, CIF, EXW, DAP…).
+- location: Location/port associated with the incoterm.
+- min_order_quantity_case: Minimum order quantity in cases.
+- port: Port of loading/destination if applicable.
+- lead_time: Lead time or availability.
+- supplier_name: Name of the supplier company (leave as "Not Found" only if truly absent).
+- supplier_reference: Supplier offer reference.
+- supplier_country: Supplier's country.
+- offer_date: Date of the offer (leave as "Not Found").
+- valid_until: Offer validity date.
+- date_received: Actual timestamp when received (leave as "Not Found").
+- source_channel: Source of data (leave as "Not Found").
+- source_filename: Name of the received file (leave as "Not Found").
+- source_message_id: Message ID (leave as "Not Found").
+- confidence_score: Confidence indicator AI (leave as 0.0).
+- error_flags: List of extraction warnings — see ERROR FLAGS rules below.
+- needs_manual_review: Boolean indicating if review needed (leave as false).
+- best_before_date: Best before date (date or 'fresh').
+- label_language: Languages on label (e.g. 'UK text', 'SA label').
+- ean_code: EAN product barcode.
+- gift_box: Indicates if product includes gift box (GBX).
+- refillable_status: REF or NRF. Use "Not Found" if not stated.
+- custom_status: T1 or T2 customs status. Use "Not Found" if not stated.
+- moq_cases: Minimum order quantity stated in the offer.
+
+══════════════════════════════════════════════════════════════════════
+RULE 1 — CUSTOM STATUS (T1 / T2)  ⚠️ HIGHEST PRIORITY
+══════════════════════════════════════════════════════════════════════
+Scan the ENTIRE text character by character for the tokens "T1" or "T2".
+- They may appear in a product code, a column, a note, anywhere — e.g.
+  "Baileys 12/100/17/DF/T2", "Status: T1", "T2 goods", "T1", a standalone cell.
+- DO NOT require a header or label to be present.
+- If "T1" appears ANYWHERE → custom_status: "T1"
+- If "T2" appears ANYWHERE → custom_status: "T2"
+- If NEITHER T1 nor T2 is found anywhere → custom_status: "Not Found"
+- Never default to "Not Found" when T1 or T2 is present in any form.
+
+══════════════════════════════════════════════════════════════════════
+RULE 2 — SUB_CATEGORY — INTELLIGENT INFERENCE  ⚠️
+══════════════════════════════════════════════════════════════════════
+Always try to infer sub_category from brand name, product name, or context.
+Use the mapping below (not exhaustive — apply common sense for unlisted brands):
+
+SPIRITS:
+  Whisky/Whiskey/Scotch/Bourbon/Malt  → sub_category: "Whisky"
+  Vodka                                → sub_category: "Vodka"
+  Gin                                  → sub_category: "Gin"
+  Rum / BACARDI / Captain Morgan / Havana Club / Diplomatico / Appleton
+                                       → sub_category: "Rum"
+  Tequila / Mezcal                     → sub_category: "Tequila"
+  Cognac / Brandy / Armagnac / HENNESSY / REMY MARTIN / MARTELL / COURVOISIER
+                                       → sub_category: "Brandy"
+  Liqueur / BAILEYS / KAHLUA / COINTREAU / AMARETTO / CAMPARI / APEROL
+                                       → sub_category: "Liqueur"
+  Absinthe                             → sub_category: "Absinthe"
+  Grappa                               → sub_category: "Grappa"
+
+WINE:
+  Red Wine / Cabernet / Merlot / Shiraz / Malbec / Pinot Noir
+                                       → sub_category: "Red Wine"
+  White Wine / Chardonnay / Sauvignon / Riesling / Pinot Grigio
+                                       → sub_category: "White Wine"
+  Rosé / Rose                          → sub_category: "Rosé Wine"
+  Champagne / Prosecco / Cava / Sparkling
+                                       → sub_category: "Sparkling Wine"
+  Port / Sherry / Vermouth / Fortified → sub_category: "Fortified Wine"
+
+BEER:
+  Lager / Pilsner / HEINEKEN / STELLA / BUDWEISER / CORONA / PERONI
+                                       → sub_category: "Lager"
+  Ale / IPA / Pale Ale / GUINNESS (Stout)
+                                       → sub_category: "Ale"
+  Stout / Porter                       → sub_category: "Stout"
+  Wheat Beer / Weiss                   → sub_category: "Wheat Beer"
+
+SOFT DRINKS:
+  Energy Drink / RED BULL / Monster    → sub_category: "Energy Drink"
+  Cola / Juice / Water / Mixer         → sub_category: (cola/juice/water/mixer)
+
+If you can confidently infer the sub_category from the brand or product name,
+DO SO even if it is not explicitly written.
+If truly impossible to determine → sub_category: "Not Found"
+
+══════════════════════════════════════════════════════════════════════
+RULE 3 — REFILLABLE STATUS (REF / NRF)
+══════════════════════════════════════════════════════════════════════
+- "REF" anywhere → refillable_status: "REF"
+- "NRF" anywhere → refillable_status: "NRF"
+- If neither found → refillable_status: "Not Found"
+- DO NOT default to "NRF" when not stated.
+
+══════════════════════════════════════════════════════════════════════
+RULE 4 — SUPPLIER NAME — COMPANY NAME ONLY  ⚠️ OVERRIDE RULE
+══════════════════════════════════════════════════════════════════════
+Extract the COMPANY name (not a person's name, not an email username).
+Priority order:
+  1. Official company name in file header, title, or footer
+     (e.g. "KOLLARAS & CO", "DIAGEO PLC", "MILANAKO LTD")
+  2. Company name in email signature block
+     (look for lines like "John Smith | KOLLARAS Trading Co.")
+  3. "Offer from <Company>" or "On behalf of <Company>" in body text
+  4. Sheet/tab name if it contains a company name
+  5. Letterhead, logo caption, or "From:" company line
+Look carefully — the company name is often in:
+- The top of a PDF or Excel file
+- The footer of an email
+- An email signature after the person's name and title
+- A "Supplier:" or "Company:" field in the document
+NEVER use: person names, email addresses, sales desk names, or email usernames.
+If truly not found after exhaustive search → supplier_name: "Not Found"
+
+══════════════════════════════════════════════════════════════════════
+RULE 5 — ERROR FLAGS
+══════════════════════════════════════════════════════════════════════
+Populate error_flags as a list of strings describing extraction issues.
+Add a flag for each of the following situations (use clear English):
+- "sub_category inferred from brand name" — when you inferred sub_category
+- "supplier_name not found" — when supplier_name could not be extracted
+- "custom_status not found" — when T1/T2 was not present
+- "refillable_status not found" — when REF/NRF was not present
+- "price ambiguous — assumed per case" — when price suffix was unclear
+- "quantity_case not explicitly stated" — when quantity was missing
+- "incoterm not found" — when no incoterm was present
+- "multiple incoterms detected — row duplicated" — when rows were split
+- Any other notable extraction issue or ambiguity
+If no issues → error_flags: []
+
+══════════════════════════════════════════════════════════════════════
+RULE 6 — MULTIPLE INCOTERMS → SEPARATE ROWS  ⚠️
+══════════════════════════════════════════════════════════════════════
+If a product has multiple incoterms (e.g. "EXW RIGA / DAP LOENDERSLOOT",
+"FOB Rotterdam or CIF London"), create ONE separate product row per incoterm.
+- All other fields (brand, product_name, price, etc.) are IDENTICAL across rows.
+- Only incoterm and location differ between the duplicate rows.
+- Add "multiple incoterms detected — row duplicated" to error_flags on each row.
+- If only one incoterm found → single row as normal.
+- If no incoterm found → incoterm: "Not Found", location: "Not Found".
+
+══════════════════════════════════════════════════════════════════════
+SUPPLIER REFERENCE — OVERRIDE RULE  ⚠️
+══════════════════════════════════════════════════════════════════════
+Scan EVERY column and piece of text. If found, MUST write to supplier_reference.
+Column names to scan:
+  "P.Code", "P Code", "Ref", "Reference", "Ref No", "Supplier Ref",
+  "Offer Ref", "Offer No", "SKU", "Item Code", "Product Code",
+  "Stock Code", "Art No", "Article", "Code", "Barcode"
+
+══════════════════════════════════════════════════════════════════════
+CRITICAL RULES FOR MISSING VALUES
+══════════════════════════════════════════════════════════════════════
+1. If a field is NOT explicitly stated in the text, return "Not Found". Do NOT invent or hallucinate values.
+2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
+3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
+4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
+5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
+6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
+7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
+8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
+9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
+10. Never hallucinate quantities. If you're unsure, use "Not Found".
+
+IMPORTANT RULES:
+1. Extract ALL products mentioned in the text. Return one object per product in the 'products' array.
+2. CAPTURE FULL NAMES: 'Baileys Original' is the product_name, not just 'Original'.
+3. If you find multiple quantities/prices for one product, create separate entries if they look like distinct offers.
+4. If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
+5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
+6. DO NOT use null for any field - always use "Not Found" for missing values.
+7. Use AI to intelligently match values to fields - if something in email matches a field, extract it.
+
+PRICE INTERPRETATION:
+- "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
+- "11,40eur/btl" → price_per_unit: 11.40
+- "32,50eur/cs" → price_per_case: 32.50
+
+QUANTITY EXTRACTION:
+- "960 cs" → quantity_case: 960
+- "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
+- "1932cs" → quantity_case: 1932
+- If quantity not specified, return "Not Found". Do NOT default to 0.
+- IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
+- quantity_case is the total number of cases offered, not the packaging configuration.
+- If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
+
+ALCOHOL PERCENT - CRITICAL INSTRUCTION:
+- Extract the alcohol percentage exactly as it appears in the source text.
+- If the text shows "40%" → output alcohol_percent: 40
+- If the text shows "5%" → output alcohol_percent: 5
+- If the text shows "17%" → output alcohol_percent: 17
+- If the text shows "40" (without % sign) → output alcohol_percent: 40
+- If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
+- If the text shows "40.0" → output alcohol_percent: 40.0
+- NEVER perform any mathematical conversion or multiplication on the alcohol value.
+- NEVER change 0.4 to 40 - keep it exactly as 0.4.
+- If alcohol percentage is not found in the text, return "Not Found".
+- Do NOT default to 0 when alcohol percentage is missing.
+
+CASES_PER_PALLET - CRITICAL RULE:
+- Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
+- Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
+- If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
+- If not explicitly stated, cases_per_pallet must be "Not Found".
+- If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
+
+QUANTITY_CASE - CRITICAL RULE:
+- Only populate quantity_case if the total number of cases is EXPLICITLY stated.
+- Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
+- Do NOT derive quantity_case from packaging information like "12x750ml".
+- "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
+- If quantity_case is not explicitly stated, it must be "Not Found".
+- If quantity_case = 0, that means "Not Found" - treat as "Not Found".
+
+INCOTERM & LOCATION:
+- Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
+- If no incoterm or location found, return "Not Found".
+- MULTIPLE INCOTERMS: See RULE 6 above — create separate rows.
+
+DATE FIELDS:
+- "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
+- "BBD 03.06.2026" → best_before_date: "2026-06-03"
+- "fresh" → best_before_date: "fresh"
+- These are NOT lead_time
+
+PACKAGING_RAW:
+- "cans" → packaging_raw: "can"
+- "btls" or "bottle" → packaging_raw: "bottle"
+
+LABEL LANGUAGE:
+- Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
+- "UK text" → label_language: "EN"
+- "SA label" → label_language: "multiple"
+- "multi text" → label_language: "multiple"
+- If not mentioned, return "Not Found".
+
+COMMON PATTERNS IN OFFERS:
+- "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
+- "6x70" → units_per_case: 6, unit_volume_ml: 700
+- "24x50cl cans" → units_per_case: 24, unit_volume_ml: 500, bottle_or_can_type: "can"
+- "960 cs" → quantity_case: 960
+- "98,5€" → price_per_case: 98.5, currency: "EUR"
+- "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
+- "EXW Loendersloot" → incoterm: "EXW", location: "Loendersloot bonded warehouse in Netherlands"
+- "DAP LOE" → incoterm: "DAP", location: "Loendersloot bonded warehouse in Netherlands"
+- "EXW RIGA / DAP LOENDERSLOOT" → TWO rows: one EXW/RIGA, one DAP/LOENDERSLOOT
+- "5 weeks LT" → lead_time: "5 weeks"
+- "BBD 03.06.2026" → best_before_date: "2026-06-03"
+- "fresh" → best_before_date: "fresh"
+- "UK text" → label_language: "EN"
+- "SA label" → label_language: "multiple"
+- "T1" or "T2" (anywhere) → custom_status: "T1" or "T2"
+- "REF" → refillable_status: "REF"
+- "NRF" → refillable_status: "NRF"
+
+REMEMBER:
+- When in doubt, use "Not Found".
+- Never invent numbers.
+- Only extract what is explicitly stated.
+- If a value is 0, that means "Not Found" - treat as "Not Found".
+- Use "Not Found" for ALL missing fields - both strings AND numbers.
+"""
+
+
 async def extract_offer(text: str) -> dict:
     logger.info(f"extract_offer called with text length: {len(text)}")
     logger.debug(f"extract_offer text preview: {text[:200]}...")
 
-    # Maximum characters per chunk to prevent context overflow (roughly 5000 tokens)
-    # Using characters vs tokens as a rough generic heuristic
     CHUNK_SIZE = 25000
 
-    # Split text into manageable chunks
     text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)] if len(text) > CHUNK_SIZE else [
         text]
     logger.info(f"Split input text into {len(text_chunks)} chunk(s).")
@@ -39,207 +321,9 @@ async def extract_offer(text: str) -> dict:
         Return JSON ONLY, no explanation.
 
         Extract ALL products from the text. Return a JSON object with a 'products' array containing ALL products found.
+        If a product has MULTIPLE INCOTERMS, create one row per incoterm (all other fields identical).
 
-        SCHEMA DEFINITION - Use EXACTLY these field names and rules:
-        - uid: Unique internal ID for each row (DO NOT generate - leave as "Not Found")
-        - product_key: Logical ID for deduplication (brand + name + volume + packaging). UPPERCASE with underscores.
-        - processing_version: Backend version used (leave as "Not Found")
-        - brand: Brand or trademark of the product.
-        - product_name: Commercial product name.
-        - product_reference: Supplier or internal reference/SKU.
-        - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
-        - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
-        - origin_country: Country of origin (ISO 2 code or full name).
-        - vintage: Vintage year (for wine/champagne).
-        - alcohol_percent: Alcohol percentage if applicable.
-        - packaging: Full packaging description (e.g. 6x750ml).
-        - unit_volume_ml: Volume per unit in milliliters (convert CL: 75CL = 750ml).
-        - units_per_case: Number of units (bottles/cans) per case.
-        - cases_per_pallet: Number of cases per pallet.
-        - quantity_case: Number of cases offered or ordered.
-        - bottle_or_can_type: Packaging type (bottle/can/other).
-        - price_per_unit: Unit price.
-        - price_per_case: Case price.
-        - currency: Currency (EUR, USD, GBP...).
-        - price_per_unit_eur: Unit price converted into EUR.
-        - price_per_case_eur: Case price converted into EUR.
-        - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
-        - location: Location/port associated with the incoterm.
-        - min_order_quantity_case: Minimum order quantity in cases.
-        - port: Port of loading/destination if applicable.
-        - lead_time: Lead time or availability.
-        - supplier_name: Name of the supplier (leave as "Not Found").
-        - supplier_reference: Supplier offer reference.
-        - supplier_country: Supplier's country.
-        - offer_date: Date of the offer (leave as "Not Found").
-        - valid_until: Offer validity date.
-        - date_received: Actual timestamp when received (leave as "Not Found").
-        - source_channel: Source of data (leave as "Not Found").
-        - source_filename: Name of the received file (leave as "Not Found").
-        - source_message_id: Message ID (leave as "Not Found").
-        - confidence_score: Confidence indicator AI (leave as 0.0).
-        - error_flags: List of errors detected (leave as empty array []).
-        - needs_manual_review: Boolean indicating if review needed (leave as false).
-        - best_before_date: Best before date (date or 'fresh').
-        - label_language: Languages on label (e.g. 'UK text', 'SA label').
-        - ean_code: EAN product barcode.
-        - gift_box: Indicates if product includes gift box (GBX).
-        - refillable_status: REF/NRF: refillable or non‑refillable.
-        - custom_status: Customs status: T1 or T2.
-        - moq_cases: Minimum order quantity stated in the offer.
-
-        CRITICAL RULES FOR MISSING VALUES:
-        1. If a field is NOT explicitly stated in the text, return "Not Found". Do NOT invent or hallucinate values.
-        2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
-        3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
-        4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
-        5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
-        6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
-        7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
-        8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
-        9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
-        10. Never hallucinate quantities. If you're unsure, use "Not Found".
-
-        IMPORTANT RULES:
-        1. Extract ALL products mentioned in the text. Return one object per product in the 'products' array.
-        2. CAPTURE FULL NAMES: 'Baileys Original' is the product_name, not just 'Original'.
-        3. If you find multiple quantities/prices for one product, create separate entries if they look like distinct offers.
-        4. If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
-        5. DO NOT leave string fields as empty string "" - if missing, use "Not Found".
-        6. DO NOT use null for any field - always use "Not Found" for missing values.
-        7. Use AI to intelligently match values to fields - if something in email matches a field, extract it
-        
-        ──────────────────────────────────────────────────────────────────
-        A8. supplier_name — COMPANY NAME ONLY -  OVERRIDE RULE
-        ──────────────────────────────────────────────────────────────────
-        Extract from (priority order):
-          1. Official company name in file header / footer
-          2. Email signature company name
-          3. "Offer from <Company>" in body
-          4. Sheet/file title if it contains a company name
-        NEVER use person names, sales desk names, or email usernames.
-        If none found → "".
-        
-        ──────────────────────────────────────────────────────────────────
-        A9. supplier_reference — OVERRIDE RULE  ⚠️
-        ──────────────────────────────────────────────────────────────────
-        Scan EVERY column and piece of text. If found, MUST write to supplier_reference.
-        
-        Column names to scan:
-          "P.Code", "P Code", "Ref", "Reference", "Ref No", "Supplier Ref",
-          "Offer Ref", "Offer No", "SKU", "Item Code", "Product Code",
-          "Stock Code", "Art No", "Article", "Code", "Barcode"
-
-
-        PRICE INTERPRETATION:
-        - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
-        - "11,40eur/btl" → price_per_unit: 11.40
-        - "32,50eur/cs" → price_per_case: 32.50
-
-        QUANTITY EXTRACTION:
-        - "960 cs" → quantity_case: 960
-        - "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
-        - "1932cs" → quantity_case: 1932
-        - If quantity not specified, return "Not Found". Do NOT default to 0.
-        - IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
-        - quantity_case is the total number of cases offered, not the packaging configuration.
-        - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
-
-        ALCOHOL PERCENT - CRITICAL INSTRUCTION:
-        - Extract the alcohol percentage exactly as it appears in the source text.
-        - If the text shows "40%" → output alcohol_percent: 40
-        - If the text shows "5%" → output alcohol_percent: 5  
-        - If the text shows "17%" → output alcohol_percent: 17
-        - If the text shows "40" (without % sign) → output alcohol_percent: 40
-        - If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
-        - If the text shows "40.0" → output alcohol_percent: 40.0
-        - NEVER perform any mathematical conversion or multiplication on the alcohol value.
-        - NEVER change 0.4 to 40 - keep it exactly as 0.4.
-        - If alcohol percentage is not found in the text, return "Not Found".
-        - Do NOT default to 0 when alcohol percentage is missing.
-
-        CASES_PER_PALLET - CRITICAL RULE:
-        - Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
-        - Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
-        - If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
-        - If not explicitly stated, cases_per_pallet must be "Not Found".
-        - If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
-
-        QUANTITY_CASE - CRITICAL RULE:
-        - Only populate quantity_case if the total number of cases is EXPLICITLY stated.
-        - Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
-        - Do NOT derive quantity_case from packaging information like "12x750ml".
-        - "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
-        - If quantity_case is not explicitly stated, it must be "Not Found".
-        - If quantity_case = 0, that means "Not Found" - treat as "Not Found".
-
-        SUPPLIER NAME EXTRACTION:
-        - Attempt to extract in this exact priority:
-          1. Extract from file content itself.
-          2. Extract from email body (e.g., "Offer from MILANAKO company").
-          3. Extract from forwarded email signature block.
-        - If none found in those places, return "Not Found". DO NOT default to the email sender.
-
-        INCOTERM & LOCATION:
-        - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
-        - If no incoterm or location found, return "Not Found".
-
-        DATE FIELDS:
-        - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
-        - "BBD 03.06.2026" → best_before_date: "2026-06-03"
-        - "fresh" → best_before_date: "fresh"
-        - These are NOT lead_time
-
-        CUSTOM STATUS:
-        - "T1" → custom_status: "T1"
-        - "T2" → custom_status: "T2"
-
-        PACKAGING_RAW:
-        - "cans" → packaging_raw: "can"
-        - "btls" or "bottle" → packaging_raw: "bottle"
-
-        LABEL LANGUAGE:
-        - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
-        - "UK text" → label_language: "EN"
-        - "SA label" → label_language: "multiple" 
-        - "multi text" → label_language: "multiple"
-        - If not mentioned, return "Not Found".
-
-        COMMON PATTERNS IN EMAILS:
-        - "Baileys Original 12/100/17/DF/T2" → 12 bottles per case, 100cl (1000ml), 17% alcohol, DF packaging, T2 status
-        - "6x70" → units_per_case: 6, unit_volume_ml: 700
-        - "24x50cl cans" → units_per_case: 24, unit_volume_ml: 500, bottle_or_can_type: "can"
-        - "960 cs" → quantity_case: 960
-        - "98,5€" → price_per_case: 98.5, currency: "EUR"
-        - "11,40eur/btl" → price_per_unit: 11.40, currency: "EUR"
-        - "EXW Loendersloot" → incoterm: "EXW", location: "Loendersloot bonded warehouse in Netherlands"
-        - "DAP LOE" → incoterm: "DAP", location: "Loendersloot bonded warehouse in Netherlands"
-        - "5 weeks LT" → lead_time: "5 weeks"
-        - "BBD 03.06.2026" → best_before_date: "2026-06-03"
-        - "fresh" → best_before_date: "fresh"
-        - "UK text" → label_language: "EN"
-        - "SA label" → label_language: "multiple"
-        - "T1" or "T2" → custom_status: "T1" or "T2"
-        - "REF" → refillable_status: "REF"
-        - "NRF" → refillable_status: "NRF"
-
-        CATEGORY DETECTION:
-        - Whisky/Whiskey/Scotch/Bourbon → category: "Spirits", sub_category: "Whisky"
-        - Champagne/Sparkling → category: "Wine", sub_category: "Champagne"
-        - Wine/Red/White → category: "Wine", sub_category: (red/white/rose)
-        - Beer/Lager/Ale → category: "Beer", sub_category: (lager/ale/stout)
-        - Cognac/Brandy → category: "Spirits", sub_category: "Brandy"
-        - Vodka/Gin/Rum → category: "Spirits", sub_category: (vodka/gin/rum)
-        - Liqueur → category: "Spirits", sub_category: "Liqueur"
-        - Soft Drinks/Energy Drinks → category: "Soft Drinks"
-        - Food → category: "Food"
-
-        REMEMBER: 
-        - When in doubt, use "Not Found". 
-        - Never invent numbers. 
-        - Only extract what is explicitly stated. 
-        - If a value is 0, that means "Not Found" - treat as "Not Found".
-        - Use "Not Found" for ALL missing fields - both strings AND numbers.
+        {SHARED_EXTRACTION_RULES}
 
         Text Chunk ({idx + 1}/{len(text_chunks)}):
         {chunk}
@@ -379,72 +463,16 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                         data_rows.append(row_dict)
 
                     batch_text = f"""
-                    EXCEL DATA BATCH ({batch_start + 1}-{batch_end} of {total_rows}):
+                    You are extracting commercial alcohol product data from Excel rows.
+                    Return JSON ONLY, no explanation.
 
-                    Extract EXACTLY {len(batch_df)} products from this data:
+                    EXCEL DATA BATCH ({batch_start + 1}-{batch_end} of {total_rows}):
+                    Extract EXACTLY {len(batch_df)} products from this data.
+                    If a product has MULTIPLE INCOTERMS, create one row per incoterm (duplicate all other fields).
 
                     {json.dumps(data_rows, indent=2)}
 
-                    SCHEMA DEFINITION - Use EXACTLY these field names:
-                    - uid: (leave as "Not Found")
-                    - product_key: UPPERCASE(brand + name + volume + packaging)
-                    - processing_version: (leave as "Not Found")
-                    - brand: Brand or trademark of the product.
-                    - product_name: Commercial product name.
-                    - product_reference: Supplier or internal reference/SKU.
-                    - category: Main category (Wine, Spirits, Beer, Soft Drinks, Food...).
-                    - sub_category: Sub-category (e.g. Red Wine, Whisky, Lager...).
-                    - origin_country: Country of origin (ISO 2 code or full name).
-                    - vintage: Vintage year (for wine/champagne).
-                    - alcohol_percent: Alcohol percentage if applicable.
-                    - packaging: Full packaging description (e.g. 6x750ml).
-                    - packaging_raw: Packaging type in raw form: "bottle" or "can". Default to "bottle" if not specified.
-                    - unit_volume_ml: Volume per unit in milliliters (convert CL).
-                    - units_per_case: Number of units per case.
-                    - cases_per_pallet: Number of cases per pallet.
-                    - quantity_case: Number of cases offered or ordered.
-                    - bottle_or_can_type: Packaging type (bottle/can/other).
-                    - price_per_unit: Unit price.
-                    - price_per_case: Case price.
-                    - currency: Currency (EUR, USD, GBP...).
-                    - price_per_unit_eur: Unit price in EUR.
-                    - price_per_case_eur: Case price in EUR.
-                    - incoterm: Incoterm (FOB, CIF, EXW, DAP…).
-                    - location: Location/port.
-                    - min_order_quantity_case: Minimum order quantity in cases.
-                    - port: Port of loading/destination if applicable.
-                    - lead_time: Lead time or availability.
-                    - supplier_name: (leave as "Not Found").
-                    - supplier_reference: Supplier offer reference.
-                    - supplier_country: Supplier's country.
-                    - offer_date: (leave as "Not Found").
-                    - valid_until: Offer validity date.
-                    - date_received: (leave as "Not Found").
-                    - source_channel: (leave as "Not Found").
-                    - source_filename: (leave as "Not Found").
-                    - source_message_id: (leave as "Not Found").
-                    - confidence_score: (leave 0.0)
-                    - error_flags: (leave empty array [])
-                    - needs_manual_review: (leave false)
-                    - best_before_date: Best before date (BBD)
-                    - label_language: Label language
-                    - ean_code: EAN product barcode
-                    - gift_box: Indicates if includes gift box (GBX)
-                    - refillable_status: REF/NRF
-                    - custom_status: Customs status: T1 or T2
-                    - moq_cases: Minimum order quantity stated in the offer.
-
-                    CRITICAL RULES FOR MISSING VALUES:
-                    1. If a field is NOT explicitly stated in the data, return "Not Found". Do NOT invent or hallucinate values.
-                    2. For numeric fields, if the value is missing, return "Not Found" - NOT 0.
-                    3. 0 should NEVER be used as a default for missing numeric values. 0 is ONLY used when "0" appears explicitly in the source.
-                    4. If a numeric field has value 0, that means "Not Found" - treat it as "Not Found".
-                    5. Do NOT calculate or derive values that aren't directly stated. Only extract what is explicitly written.
-                    6. For "12x750ml" -> units_per_case = 12, unit_volume_ml = 750. Do NOT create a quantity_case value from this.
-                    7. If you see "12x750ml" and no other quantity information, quantity_case must be "Not Found", NOT 233 or any other number.
-                    8. cases_per_pallet must be "Not Found" unless pallet quantity is explicitly written (e.g., "60 cases per pallet", "60 cs/pallet").
-                    9. If you see "FTL", "Full Truck Load", or similar, do NOT assign any value to cases_per_pallet.
-                    10. Never hallucinate quantities. If you're unsure, use "Not Found".
+                    {SHARED_EXTRACTION_RULES}
 
                     MAPPING FROM EXCEL DATA:
                     - Ensure you capture the full product name and brand.
@@ -453,87 +481,6 @@ async def extract_from_file(file_path: str, content_type: str) -> Dict[str, Any]
                     - If a field is NOT FOUND or doesn't exist, use "Not Found" (NOT null and NOT 0).
                     - NEVER return empty string "" for missing values, always use "Not Found".
                     - DO NOT use null for any field - always use "Not Found" for missing values.
-
-                    PRICE INTERPRETATION:
-                    - "15.95eur" → price_per_case: 15.95 (when no /btl or /cs suffix, assume per case)
-                    - "11,40eur/btl" → price_per_unit: 11.40
-                    - "32,50eur/cs" → price_per_case: 32.50
-
-                    QUANTITY EXTRACTION:
-                    - "960 cs" → quantity_case: 960
-                    - "256cs x 3" → quantity_case: 768 (only calculate when multiplication is explicitly shown like "x 3")
-                    - "1932cs" → quantity_case: 1932
-                    - If quantity not specified, return "Not Found". Do NOT default to 0.
-                    - IMPORTANT: For packaging like "12x750ml", this defines units_per_case (12) and unit_volume_ml (750), NOT quantity_case.
-                    - quantity_case is the total number of cases offered, not the packaging configuration.
-                    - If quantity explicitly relates to "FTL" or "Full Truck Load", do NOT assign it to cases_per_pallet. Only assign cases_per_pallet if explicitly stated as a pallet quantity.
-
-                    ALCOHOL PERCENT - CRITICAL INSTRUCTION:
-                    - Extract the alcohol percentage exactly as it appears in the source text.
-                    - If the text shows "40%" → output alcohol_percent: 40
-                    - If the text shows "5%" → output alcohol_percent: 5
-                    - If the text shows "17%" → output alcohol_percent: 17
-                    - If the text shows "40" (without % sign) → output alcohol_percent: 40
-                    - If the text shows "0.4" or "0,4" → output alcohol_percent: 0.4 (DO NOT multiply by 100)
-                    - If the text shows "40.0" → output alcohol_percent: 40.0
-                    - NEVER perform any mathematical conversion or multiplication on the alcohol value.
-                    - NEVER change 0.4 to 40 - keep it exactly as 0.4.
-                    - If alcohol percentage is not found in the text, return "Not Found".
-                    - Do NOT default to 0 when alcohol percentage is missing.
-
-                    CASES_PER_PALLET - CRITICAL RULE:
-                    - Only populate cases_per_pallet if pallet quantity is EXPLICITLY stated.
-                    - Examples of explicit pallet quantity: "60 cases per pallet", "60 cs/pallet", "palletizes 60 cases"
-                    - If you see "FTL", "Full Truck Load", or truck-related quantities, do NOT populate cases_per_pallet.
-                    - If not explicitly stated, cases_per_pallet must be "Not Found".
-                    - If cases_per_pallet = 0, that means "Not Found" - treat as "Not Found".
-
-                    QUANTITY_CASE - CRITICAL RULE:
-                    - Only populate quantity_case if the total number of cases is EXPLICITLY stated.
-                    - Examples: "960 cs", "quantity: 500 cases", "order: 250 cs"
-                    - Do NOT derive quantity_case from packaging information like "12x750ml".
-                    - "12x750ml" describes the packaging format (12 bottles of 750ml per case), not how many cases are being offered.
-                    - If quantity_case is not explicitly stated, it must be "Not Found".
-                    - If quantity_case = 0, that means "Not Found" - treat as "Not Found".
-
-                    SUPPLIER NAME EXTRACTION:
-                    - Attempt to extract in this exact priority:
-                      1. Extract from file content itself.
-                      2. Extract from email body (e.g., "Offer from MILANAKO company").
-                      3. Extract from forwarded email signature block.
-                    - If none found in those places, return "Not Found". DO NOT default to the email sender.
-
-                    INCOTERM & LOCATION:
-                    - Example: "FCA Prague" → incoterm: "FCA", location: "Prague"
-                    - If no incoterm or location found, return "Not Found".
-
-                    DATE FIELDS:
-                    - "9/2026", "8/2026" → best_before_date: "2026-09-01", "2026-08-01"
-                    - "BBD 03.06.2026" → best_before_date: "2026-06-03"
-                    - "fresh" → best_before_date: "fresh"
-                    - These are NOT lead_time
-
-                    CUSTOM STATUS OR STATUS:
-                    - "T1" → custom_status: "T1"
-                    - "T2" → custom_status: "T2"
-
-                    PACKAGING_RAW:
-                    - "cans" → packaging_raw: "can"
-                    - "btls" or "bottle" → packaging_raw: "bottle"
-
-                    LABEL LANGUAGE:
-                    - Only extract when explicitly mentioned: "UK text", "SA label", "multi text"
-                    - "UK text" → label_language: "EN"
-                    - "SA label" → label_language: "multiple" 
-                    - "multi text" → label_language: "multiple"
-                    - If not mentioned, return "Not Found".
-
-                    REMEMBER: 
-                    - When in doubt, use "Not Found". 
-                    - Never invent numbers. 
-                    - Only extract what is explicitly stated. 
-                    - If a value is 0, that means "Not Found" - treat as "Not Found".
-                    - Use "Not Found" for ALL missing fields - both strings AND numbers.
 
                     RETURN FORMAT:
                     {{
@@ -849,22 +796,22 @@ def clean_product_data(product: dict) -> dict:
         'sub_category': "Not Found",
         'origin_country': "Not Found",
         'vintage': "Not Found",
-        'alcohol_percent': None,  # Changed from "Not Found" to None for numeric fields
+        'alcohol_percent': None,
         'packaging': "Not Found",
         'packaging_raw': "bottle",
-        'unit_volume_ml': None,  # Changed from "Not Found" to None for numeric fields
-        'units_per_case': None,  # Changed from "Not Found" to None for numeric fields
-        'cases_per_pallet': None,  # Changed from "Not Found" to None for numeric fields
-        'quantity_case': None,  # Changed from "Not Found" to None for numeric fields
+        'unit_volume_ml': None,
+        'units_per_case': None,
+        'cases_per_pallet': None,
+        'quantity_case': None,
         'bottle_or_can_type': "Not Found",
-        'price_per_unit': None,  # Changed from "Not Found" to None for numeric fields
-        'price_per_case': None,  # Changed from "Not Found" to None for numeric fields
+        'price_per_unit': None,
+        'price_per_case': None,
         'currency': "EUR",
-        'price_per_unit_eur': None,  # Changed from "Not Found" to None for numeric fields
-        'price_per_case_eur': None,  # Changed from "Not Found" to None for numeric fields
+        'price_per_unit_eur': None,
+        'price_per_case_eur': None,
         'incoterm': "Not Found",
         'location': "Not Found",
-        'min_order_quantity_case': None,  # Changed from "Not Found" to None for numeric fields
+        'min_order_quantity_case': None,
         'port': "Not Found",
         'lead_time': "Not Found",
         'supplier_name': "Not Found",
@@ -883,9 +830,9 @@ def clean_product_data(product: dict) -> dict:
         'label_language': "Not Found",
         'ean_code': "Not Found",
         'gift_box': "Not Found",
-        'refillable_status': "NRF",
+        'refillable_status': "Not Found",
         'custom_status': "Not Found",
-        'moq_cases': None  # Changed from "Not Found" to None for numeric fields
+        'moq_cases': None
     }
 
     cleaned_product = {}
